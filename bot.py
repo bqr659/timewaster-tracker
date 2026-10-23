@@ -25,13 +25,17 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from sqlalchemy import (create_engine, inspect, text as sql_text, Column, Integer, BigInteger, String,
                         Text, DateTime, JSON, Boolean, ForeignKey, func, desc)
 from sqlalchemy.orm import declarative_base, sessionmaker
-from telegram import (Update, InlineKeyboardButton as Btn, InlineKeyboardMarkup as Kb,
+from telegram import (Update, InlineKeyboardButton as _IKB, InlineKeyboardMarkup as Kb,
                       InputMediaPhoto, BotCommand, LinkPreviewOptions,
                       MessageOriginUser, MessageOriginHiddenUser)
 from telegram.constants import ParseMode, ChatType
 from telegram.error import TelegramError, BadRequest, RetryAfter, NetworkError
 from telegram.ext import (Application, CommandHandler, MessageHandler, CallbackQueryHandler,
                           ConversationHandler, TypeHandler, filters)
+
+def Btn(text, data):
+    """Callback button. (InlineKeyboardButton's 2nd positional arg is `url`, so callback_data must be named.)"""
+    return _IKB(text, callback_data=data)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("tw")
