@@ -1,47 +1,64 @@
 """
-Timewaster Tracker v2  -  no website, two Telegram bots in one process.
+Timewaster Tracker v3  -  two Telegram bots in one process.
 
-PUBLIC BOT  (BOT_TOKEN)        : file reports, /check users, track your own reports
-ADMIN BOT   (ADMIN_BOT_TOKEN)  : button panel -> approve / reject / edit @ / change status
-CHANNEL     (CHANNEL_ID)       : approved reports are auto-posted (photos + details),
-                                 and edited automatically when the status or @ changes.
+PUBLIC BOT  (BOT_TOKEN)        : file reports, /check users, track / withdraw your reports,
+                                 answer admin questions, appeal a report against you.
+ADMIN BOT   (ADMIN_BOT_TOKEN)  : button panel -> approve / reject / ask reporter / notes /
+                                 edit @ / change status / retract / ban / export / diagnostics.
+CHANNEL     (CHANNEL_ID)       : approved reports are auto-posted (photos + details) and edited
+                                 automatically when the status or the @ changes.
 TRACKER                        : follows users by numeric ID, detects @ swaps, updates posts.
+
+Required env : BOT_TOKEN, ADMIN_BOT_TOKEN, CHANNEL_ID, DATABASE_URL, ADMIN_IDS
+Optional env : CHANNEL_USERNAME, TRACK_INTERVAL_MIN (30), MAX_PENDING_PER_USER (3),
+               REPORT_COOLDOWN_MIN (10), MAX_REPORTS_PER_DAY (5), REMIND_AFTER_HOURS (24), PORT
 """
-import os, re, html, asyncio, logging, threading
-from datetime import datetime, timezone
+import os, re, io, csv, sys, html, time, asyncio, logging, threading
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from sqlalchemy import (create_engine, Column, Integer, BigInteger, String, Text,
-                        DateTime, JSON, Boolean, ForeignKey, func, desc)
+from sqlalchemy import (create_engine, inspect, text as sql_text, Column, Integer, BigInteger, String,
+                        Text, DateTime, JSON, Boolean, ForeignKey, func, desc)
 from sqlalchemy.orm import declarative_base, sessionmaker
 from telegram import (Update, InlineKeyboardButton as Btn, InlineKeyboardMarkup as Kb,
                       InputMediaPhoto, BotCommand, LinkPreviewOptions,
                       MessageOriginUser, MessageOriginHiddenUser)
 from telegram.constants import ParseMode, ChatType
-from telegram.error import TelegramError, BadRequest
+from telegram.error import TelegramError, BadRequest, RetryAfter, NetworkError
 from telegram.ext import (Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-                          ConversationHandler, ContextTypes, TypeHandler, filters)
+                          ConversationHandler, TypeHandler, filters)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("tw")
 
 # ───────────────────────── config ─────────────────────────
-PUB_TOKEN = os.environ["BOT_TOKEN"]
-ADM_TOKEN = os.environ["ADMIN_BOT_TOKEN"]
-_ch = os.environ["CHANNEL_ID"].strip()
+def need(name):
+    v = os.getenv(name, "").strip()
+    if not v: sys.exit(f"Missing environment variable: {name}")
+    return v
+
+PUB_TOKEN, ADM_TOKEN = need("BOT_TOKEN"), need("ADMIN_BOT_TOKEN")
+if PUB_TOKEN == ADM_TOKEN: sys.exit("BOT_TOKEN and ADMIN_BOT_TOKEN must be two different bots.")
+_ch = need("CHANNEL_ID")
 CHANNEL = int(_ch) if _ch.lstrip("-").isdigit() else _ch
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "").lstrip("@")      # optional, for post links
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-DB_URL = os.environ["DATABASE_URL"].replace("postgres://", "postgresql://", 1)
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "").lstrip("@")
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().lstrip("-").isdigit()}
+if not ADMIN_IDS: sys.exit("ADMIN_IDS is empty - nobody could use the admin bot. Set it to your numeric Telegram ID.")
+DB_URL = need("DATABASE_URL").replace("postgres://", "postgresql://", 1)
 TRACK_MIN = int(os.getenv("TRACK_INTERVAL_MIN", "30"))
 MAX_PENDING = int(os.getenv("MAX_PENDING_PER_USER", "3"))
+COOLDOWN_MIN = int(os.getenv("REPORT_COOLDOWN_MIN", "10"))
+MAX_PER_DAY = int(os.getenv("MAX_REPORTS_PER_DAY", "5"))
+REMIND_H = int(os.getenv("REMIND_AFTER_HOURS", "24"))
 MAX_PHOTOS = 8
+LOCK_KEY = 7340117                                  # postgres advisory lock id (single-instance guard)
 
 DEALS = ["Account Trade", "Middleman Deal", "Service", "Other"]
 PUBLISHED = ("VERIFIED", "DISPUTED", "RESOLVED")
 BADGE = {"PENDING": "⏳ PENDING", "VERIFIED": "✅ VERIFIED", "DISPUTED": "⚠️ DISPUTED",
          "RESOLVED": "🟢 RESOLVED", "REJECTED": "❌ REJECTED"}
+NOTE_ICON = {"admin": "📝", "answer": "💬", "appeal": "⚖️"}
 HTML = ParseMode.HTML
 NOPREV = LinkPreviewOptions(is_disabled=True)
 REJECT_REASONS = {"np": "Not enough proof", "dup": "Duplicate report",
@@ -50,6 +67,8 @@ REJECT_REASONS = {"np": "Not enough proof", "dup": "Duplicate report",
 pub: Application = None
 adm: Application = None
 PUB_USERNAME = ""
+STARTED = time.time()
+STATE = {"track_at": None, "track_res": None, "remind_at": 0.0, "err_at": 0.0}
 
 # ───────────────────────── database ─────────────────────────
 engine = create_engine(DB_URL, pool_pre_ping=True, pool_recycle=300)
@@ -57,6 +76,7 @@ Session = sessionmaker(engine, expire_on_commit=False)
 Base = declarative_base()
 
 def now(): return datetime.now(timezone.utc)
+def aware(d): return d if d is None or d.tzinfo else d.replace(tzinfo=timezone.utc)
 
 class Subject(Base):                      # one real person, many usernames
     __tablename__ = "tw_subjects"
@@ -88,6 +108,8 @@ class Report(Base):
     status = Column(String(16), default="PENDING", index=True)
     chan_msgs = Column(JSON, default=list)
     chan_has_photo = Column(Boolean, default=False)
+    approved_by = Column(String(64), nullable=True)                      # v3
+    published_at = Column(DateTime(timezone=True), nullable=True)        # v3
     created_at = Column(DateTime(timezone=True), default=now)
 
 class StatusLog(Base):                    # the tracking timeline
@@ -99,20 +121,72 @@ class StatusLog(Base):                    # the tracking timeline
     note = Column(String(200), nullable=True)
     at = Column(DateTime(timezone=True), default=now)
 
+class Note(Base):                         # v3: admin notes, reporter answers, appeals
+    __tablename__ = "tw_notes"
+    id = Column(Integer, primary_key=True)
+    report_id = Column(Integer, ForeignKey("tw_reports.id"), index=True)
+    kind = Column(String(16))             # admin | answer | appeal
+    author_id = Column(BigInteger, nullable=True)
+    author = Column(String(64))
+    text = Column(Text)
+    at = Column(DateTime(timezone=True), default=now)
+
 class Banned(Base):
     __tablename__ = "tw_banned"
     user_id = Column(BigInteger, primary_key=True)
 
-Base.metadata.create_all(engine)
+MIGRATIONS = [("tw_reports", "approved_by", "VARCHAR(64)"),
+              ("tw_reports", "published_at", "TIMESTAMP WITH TIME ZONE")]
+
+def init_db():
+    """Create new tables and add columns that v2 databases don't have yet."""
+    Base.metadata.create_all(engine)
+    insp = inspect(engine)
+    with engine.begin() as cx:
+        for table, col, ddl in MIGRATIONS:
+            if col not in {c["name"] for c in insp.get_columns(table)}:
+                cx.execute(sql_text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
+                log.info("migrated: %s.%s", table, col)
+
+def acquire_lock():
+    """Only one copy may poll Telegram. A second copy waits here (fixes 'Conflict' errors on redeploy)."""
+    if engine.dialect.name != "postgresql": return None
+    cx = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+    while not cx.execute(sql_text("SELECT pg_try_advisory_lock(:k)"), {"k": LOCK_KEY}).scalar():
+        log.warning("Another instance is running - waiting for it to stop...")
+        time.sleep(5)
+    return cx
 
 # ───────────────────────── helpers ─────────────────────────
 def esc(x): return html.escape(str(x if x is not None else ""))
 def label(sub): return f"@{sub.username}" if sub.username else f"ID {sub.user_id}"
 USERNAME_RE = re.compile(r"[A-Za-z0-9_]{4,32}")
+_hits = {}
+
+def throttle(uid, key, limit, per):
+    """True if allowed. Simple in-memory sliding window."""
+    t, k = time.monotonic(), (uid, key)
+    q = [x for x in _hits.get(k, []) if t - x < per]
+    ok = len(q) < limit
+    if ok: q.append(t)
+    _hits[k] = q
+    return ok
 
 def log_status(s, r, status, by, note=None):
     r.status = status
     s.add(StatusLog(report_id=r.id, status=status, by=by, note=note))
+
+def claim(rid, frm, to, by, note=None):
+    """Atomically move a report between statuses. False if someone else already did (double-click safe)."""
+    frm = (frm,) if isinstance(frm, str) else tuple(frm)
+    with Session() as s:
+        n = (s.query(Report).filter(Report.id == rid, Report.status.in_(frm))
+             .update({"status": to}, synchronize_session=False))
+        if n:
+            s.add(StatusLog(report_id=rid, status=to, by=by, note=note)); s.commit()
+        else:
+            s.rollback()
+        return bool(n)
 
 def aliases_of(s, sub):
     out, seen = [], {(sub.username or "").lower()}
@@ -159,7 +233,11 @@ def find_subjects(s, t):
             .filter(func.lower(Alias.username) == t.lower()).distinct().all())
 
 def post_url(r):
-    return f"https://t.me/{CHANNEL_USERNAME}/{r.chan_msgs[0]}" if CHANNEL_USERNAME and r.chan_msgs else None
+    if not r.chan_msgs: return None
+    if CHANNEL_USERNAME: return f"https://t.me/{CHANNEL_USERNAME}/{r.chan_msgs[0]}"
+    if isinstance(CHANNEL, int) and str(CHANNEL).startswith("-100"):     # private channel link
+        return f"https://t.me/c/{str(CHANNEL)[4:]}/{r.chan_msgs[0]}"
+    return None
 
 def parse_identity(m):
     """text / forwarded message -> (user_id, username, name, error)"""
@@ -176,16 +254,43 @@ def parse_identity(m):
     if USERNAME_RE.fullmatch(t): return None, t, None, None
     return None, None, None, "Send a @username, a numeric ID, or forward a message from the user."
 
+async def tg(fn, *a, **k):
+    """Call a Telegram API method, waiting out flood limits instead of failing."""
+    for _ in range(3):
+        try: return await fn(*a, **k)
+        except RetryAfter as e:
+            ra = e.retry_after
+            await asyncio.sleep((ra.total_seconds() if hasattr(ra, "total_seconds") else ra) + 1)
+    return await fn(*a, **k)
+
 async def tell(uid, text, kb=None):
     try:
-        await pub.bot.send_message(uid, text, parse_mode=HTML, reply_markup=kb, link_preview_options=NOPREV)
+        await tg(pub.bot.send_message, uid, text, parse_mode=HTML, reply_markup=kb, link_preview_options=NOPREV)
     except TelegramError: pass
 
 async def alert_admins(text, kb=None):
     for a in ADMIN_IDS:
         try:
-            await adm.bot.send_message(a, text, parse_mode=HTML, reply_markup=kb, link_preview_options=NOPREV)
+            await tg(adm.bot.send_message, a, text, parse_mode=HTML, reply_markup=kb, link_preview_options=NOPREV)
         except TelegramError: pass
+
+async def notify_appellants(rid, text):
+    with Session() as s:
+        ids = {n.author_id for n in s.query(Note).filter_by(report_id=rid, kind="appeal") if n.author_id}
+    for i in ids: await tell(i, text)
+
+async def channel_check():
+    """(ok, message) - can the public bot post / edit / delete in the channel?"""
+    try:
+        me = await pub.bot.get_chat_member(CHANNEL, pub.bot.id)
+    except TelegramError as e:
+        return False, f"Can't access the channel ({e}). Check CHANNEL_ID and add the PUBLIC bot as a channel admin."
+    if me.status == "creator": return True, "Channel OK."
+    if me.status != "administrator": return False, "The public bot is not an admin of the channel."
+    miss = [n for n, a in (("post", "can_post_messages"), ("edit", "can_edit_messages"),
+                           ("delete", "can_delete_messages")) if not getattr(me, a, False)]
+    if miss: return False, "The public bot lacks channel permission(s): " + ", ".join(miss)
+    return True, "Channel OK (public bot can post, edit and delete)."
 
 # ───────────────────────── channel posting ─────────────────────────
 def render_post(s, r, limit):
@@ -202,33 +307,36 @@ def render_post(s, r, limit):
         L += [f"🏷 {esc(r.deal_type)}", f"📅 {r.created_at:%d %b %Y}", "", f"📝 {esc(reason)}"]
         if r.proof_link: L.append(f'\n🔗 <a href="{esc(r.proof_link)}">Proof channel</a>')
         L.append(f"\n📊 Reports on this user: {total} ({ver} verified)")
-        if PUB_USERNAME: L.append(f"🤖 Check anyone: @{PUB_USERNAME}")
+        if PUB_USERNAME:
+            L.append(f'🔍 <a href="https://t.me/{PUB_USERNAME}?start=r{r.id}">Full history</a> · '
+                     f"🤖 @{PUB_USERNAME} · ⚖️ Disagree? /appeal {r.id}")
         return "\n".join(L)
 
     reason = r.reason or ""
-    text = build(reason)
-    while len(text) > limit and len(reason) > 21:
-        reason = reason[:max(20, len(reason) - (len(text) - limit) - 5)].rstrip() + "…"
-        text = build(reason)
-    return text
+    out = build(reason)
+    while len(out) > limit and len(reason) > 21:
+        reason = reason[:max(20, len(reason) - (len(out) - limit) - 5)].rstrip() + "…"
+        out = build(reason)
+    return out
 
 async def publish(rid):
     with Session() as s:
         r = s.get(Report, rid)
         photos = list(r.photo_ids or [])
-        text = render_post(s, r, 1024 if photos else 4000)
+        body = render_post(s, r, 1024 if photos else 4000)
     if not photos:
-        ms = [await pub.bot.send_message(CHANNEL, text, parse_mode=HTML, link_preview_options=NOPREV)]
+        ms = [await tg(pub.bot.send_message, CHANNEL, body, parse_mode=HTML, link_preview_options=NOPREV)]
     elif len(photos) == 1:
-        ms = [await pub.bot.send_photo(CHANNEL, photos[0], caption=text, parse_mode=HTML)]
+        ms = [await tg(pub.bot.send_photo, CHANNEL, photos[0], caption=body, parse_mode=HTML)]
     else:
-        media = [InputMediaPhoto(photos[0], caption=text, parse_mode=HTML)] + \
+        media = [InputMediaPhoto(photos[0], caption=body, parse_mode=HTML)] + \
                 [InputMediaPhoto(p) for p in photos[1:10]]
-        ms = await pub.bot.send_media_group(CHANNEL, media=media)
+        ms = await tg(pub.bot.send_media_group, CHANNEL, media=media)
     with Session() as s:
         r = s.get(Report, rid)
         r.chan_msgs = [m.message_id for m in ms]
         r.chan_has_photo = bool(photos)
+        r.published_at = now()
         s.commit()
 
 async def refresh_post(rid):
@@ -236,13 +344,13 @@ async def refresh_post(rid):
         r = s.get(Report, rid)
         if not r or not r.chan_msgs: return
         photo, mid = r.chan_has_photo, r.chan_msgs[0]
-        text = render_post(s, r, 1024 if photo else 4000)
+        body = render_post(s, r, 1024 if photo else 4000)
     try:
         if photo:
-            await pub.bot.edit_message_caption(CHANNEL, mid, caption=text, parse_mode=HTML)
+            await tg(pub.bot.edit_message_caption, CHANNEL, mid, caption=body, parse_mode=HTML)
         else:
-            await pub.bot.edit_message_text(text, chat_id=CHANNEL, message_id=mid,
-                                            parse_mode=HTML, link_preview_options=NOPREV)
+            await tg(pub.bot.edit_message_text, body, chat_id=CHANNEL, message_id=mid,
+                     parse_mode=HTML, link_preview_options=NOPREV)
     except BadRequest as e:
         if "not modified" not in str(e).lower(): log.warning("refresh #%s: %s", rid, e)
     except TelegramError as e:
@@ -251,13 +359,14 @@ async def refresh_post(rid):
 async def refresh_subject(sub_id):
     with Session() as s:
         ids = [r.id for r in s.query(Report).filter(Report.subject_id == sub_id, Report.status.in_(PUBLISHED))]
-    for i in ids: await refresh_post(i)
+    for i in ids:
+        await refresh_post(i); await asyncio.sleep(0.35)
 
 async def retract(rid):
     with Session() as s:
         r = s.get(Report, rid); ids = list(r.chan_msgs or [])
     for mid in ids:
-        try: await pub.bot.delete_message(CHANNEL, mid)
+        try: await tg(pub.bot.delete_message, CHANNEL, mid)
         except TelegramError: pass
     with Session() as s:
         r = s.get(Report, rid); r.chan_msgs = []; s.commit()
@@ -284,7 +393,7 @@ async def track_all():
             uid = sub.user_id
         old = new = None
         try:
-            chat = await pub.bot.get_chat(uid)
+            chat = await tg(pub.bot.get_chat, uid)
             ok = True
             with Session() as s:
                 sub = s.get(Subject, sid)
@@ -299,6 +408,7 @@ async def track_all():
         if old:
             changed += 1; await on_username_change(sid, old, new)
         await asyncio.sleep(0.4)
+    STATE["track_at"], STATE["track_res"] = now(), (checked, changed, len(ids))
     return checked, changed
 
 async def tracker_loop():
@@ -307,6 +417,22 @@ async def tracker_loop():
         try: await track_all()
         except Exception: log.exception("tracker")
         await asyncio.sleep(TRACK_MIN * 60)
+
+async def reminder_loop():
+    """Nudge admins about reports that have been waiting too long."""
+    await asyncio.sleep(120)
+    while True:
+        try:
+            cutoff = now() - timedelta(hours=REMIND_H)
+            with Session() as s:
+                old = s.query(Report).filter(Report.status == "PENDING", Report.created_at < cutoff).order_by(Report.id).all()
+                ids = [r.id for r in old]
+            if ids and time.time() - STATE["remind_at"] > 12 * 3600:
+                STATE["remind_at"] = time.time()
+                await alert_admins(f"⏰ <b>{len(ids)} report(s)</b> have been waiting over {REMIND_H}h for review.",
+                                   Kb([[Btn(f"📂 Open oldest (#{ids[0]})", f"r:{ids[0]}")]]))
+        except Exception: log.exception("reminder")
+        await asyncio.sleep(1800)
 
 async def passive_track(u: Update, c):
     """If a tracked user ever talks to the public bot, we learn their current @ for free."""
@@ -332,15 +458,23 @@ async def say(u, text, kb=None):
 
 async def p_start(u, c):
     c.user_data.pop("await", None)
+    arg = c.args[0] if c.args else ""
+    if len(arg) > 1 and arg[0] == "r" and arg[1:].isdigit():        # deep link from a channel post
+        with Session() as s:
+            r = s.get(Report, int(arg[1:]))
+            sub = s.get(Subject, r.subject_id) if r and r.status in PUBLISHED else None
+            card = subject_card(s, sub) if sub else None
+        if card: await say(u, card, pub_home_kb()); return
     await say(u, "⏳ <b>Timewaster Tracker</b>\nReport flakers, check who you're dealing with, "
                  "and follow your reports.", pub_home_kb())
 
 async def p_help(u, c):
     if u.callback_query: await u.callback_query.answer()
-    await say(u, "<b>How it works</b>\n1. File a report with proof (screenshots + optional proof channel).\n"
+    await say(u, "<b>How it works</b>\n1. File a report with proof (screenshots and/or a proof-channel link).\n"
                  "2. An admin reviews it. If approved it's posted on the channel with your proof.\n"
-                 "3. You get a message whenever the status changes.\n\n"
-                 "/report · /check · /my · /track &lt;id&gt; · /cancel", pub_home_kb())
+                 "3. You get a message whenever the status changes, and admins may ask you for more info.\n\n"
+                 "<b>Commands</b>\n/report · /check · /my · /track &lt;id&gt; · /appeal &lt;id&gt; "
+                 "(if a report is about <i>you</i>) · /cancel", pub_home_kb())
 
 async def rep_start(u, c):
     if u.callback_query: await u.callback_query.answer()
@@ -349,8 +483,17 @@ async def rep_start(u, c):
         if s.get(Banned, uid):
             await say(u, "🚫 You can't file reports."); return ConversationHandler.END
         pend = s.query(Report).filter_by(reporter_id=uid, status="PENDING").count()
+        last = aware(s.query(func.max(Report.created_at)).filter(Report.reporter_id == uid).scalar())
+        today = s.query(Report).filter(Report.reporter_id == uid, Report.created_at > now() - timedelta(days=1)).count()
     if pend >= MAX_PENDING:
         await say(u, f"You already have {pend} reports waiting for review. Please wait for those first.")
+        return ConversationHandler.END
+    if today >= MAX_PER_DAY:
+        await say(u, f"Daily limit reached ({MAX_PER_DAY} reports / 24h). Try again tomorrow.")
+        return ConversationHandler.END
+    if last and now() - last < timedelta(minutes=COOLDOWN_MIN):
+        wait = COOLDOWN_MIN - int((now() - last).total_seconds() // 60)
+        await say(u, f"Please wait about {wait} min before filing another report.")
         return ConversationHandler.END
     c.user_data.pop("await", None)
     c.user_data["rep"] = {"photos": []}
@@ -360,16 +503,20 @@ async def rep_start(u, c):
     return TARGET
 
 async def got_target(u, c):
-    m = u.message
-    uid, uname, name, err = parse_identity(m)
+    uid, uname, name, err = parse_identity(u.message)
     if err:
         await say(u, "⚠️ " + err); return TARGET
     if uid == u.effective_user.id:
         await say(u, "You can't report yourself 🙂"); return TARGET
+    if uid in ADMIN_IDS:
+        await say(u, "That account is protected and can't be reported."); return TARGET
     if uname and not uid:               # best-effort: resolve @ -> ID
         try:
             ch = await c.bot.get_chat("@" + uname)
-            if ch.type == ChatType.PRIVATE: uid, name = ch.id, ch.full_name
+            if ch.type == ChatType.PRIVATE:
+                uid, name = ch.id, ch.full_name
+                if uid in ADMIN_IDS:
+                    await say(u, "That account is protected and can't be reported."); return TARGET
         except TelegramError: pass
     c.user_data["rep"].update(uid=uid, uname=uname, name=name)
     kb = Kb([[Btn(d, f"d:{i}")] for i, d in enumerate(DEALS)])
@@ -388,7 +535,7 @@ async def got_reason(u, c):
         await say(u, "Please add a bit more detail (at least 15 characters)."); return REASON
     c.user_data["rep"]["reason"] = t[:1200]
     await say(u, f"<b>Step 4/4 · Proof</b>\nSend your screenshots here (up to {MAX_PHOTOS}) and/or a link to a "
-                 "Telegram channel with your proof. Press <b>Done</b> when finished.",
+                 "Telegram channel with your proof. <b>At least one is required.</b> Press <b>Done</b> when finished.",
               Kb([[Btn("✅ Done", "pf:done")]]))
     return PROOF
 
@@ -397,7 +544,13 @@ async def got_photo(u, c):
     if len(rep["photos"]) >= MAX_PHOTOS:
         await say(u, f"Max {MAX_PHOTOS} photos reached."); return PROOF
     rep["photos"].append(u.message.photo[-1].file_id)
-    await say(u, f"📸 {len(rep['photos'])}/{MAX_PHOTOS} saved.", Kb([[Btn("✅ Done", "pf:done")]]))
+    txt, kb = f"📸 {len(rep['photos'])}/{MAX_PHOTOS} saved.", Kb([[Btn("✅ Done", "pf:done")]])
+    if rep.get("pmsg"):                               # keep one counter message instead of spamming
+        try:
+            await c.bot.edit_message_text(txt, chat_id=u.effective_chat.id, message_id=rep["pmsg"], reply_markup=kb)
+            return PROOF
+        except TelegramError: pass
+    rep["pmsg"] = (await say(u, txt, kb)).message_id
     return PROOF
 
 async def got_link(u, c):
@@ -411,9 +564,13 @@ async def got_link(u, c):
 
 async def proof_done(u, c):
     if u.callback_query: await u.callback_query.answer()
-    r = c.user_data["rep"]
+    r = c.user_data.get("rep")
+    if not r: return ConversationHandler.END
+    if not r["photos"] and not r.get("link"):
+        await say(u, "⚠️ Please add at least one screenshot or a proof link first."); return PROOF
     who = f"@{r['uname']}" if r.get("uname") else f"ID {r['uid']}"
-    await say(u, f"<b>Please confirm</b>\n\n👤 {esc(who)}" + (f" (ID <code>{r['uid']}</code>)" if r.get("uid") and r.get("uname") else "") +
+    await say(u, f"<b>Please confirm</b>\n\n👤 {esc(who)}" +
+                 (f" (ID <code>{r['uid']}</code>)" if r.get("uid") and r.get("uname") else "") +
                  f"\n🏷 {esc(r['deal'])}\n📝 {esc(r['reason'])}\n📸 {len(r['photos'])} photo(s)"
                  f"\n🔗 {esc(r.get('link') or 'no link')}\n\nSubmit this report?",
               Kb([[Btn("✅ Submit", "c:yes"), Btn("✖️ Cancel", "c:no")]]))
@@ -425,6 +582,16 @@ async def submit(u, c):
     if not d: return ConversationHandler.END
     with Session() as s:
         sub = upsert_subject(s, d.get("uname"), d.get("uid"), d.get("name"))
+        if sub.user_id in ADMIN_IDS:
+            s.rollback(); c.user_data.pop("rep", None)
+            await q.message.reply_text("That account is protected and can't be reported."); return ConversationHandler.END
+        dup = s.query(Report).filter(Report.subject_id == sub.id, Report.reporter_id == usr.id,
+                                     Report.status.in_(("PENDING",) + PUBLISHED)).first()
+        if dup:
+            dup_id = dup.id; s.rollback(); c.user_data.pop("rep", None)
+            await q.message.reply_text(f"You already reported this user (report #{dup_id}). "
+                                       f"Use /track {dup_id} to follow it.", reply_markup=pub_home_kb())
+            return ConversationHandler.END
         rep = Report(subject_id=sub.id, reporter_id=usr.id,
                      reporter_name=f"@{usr.username}" if usr.username else str(usr.id),
                      deal_type=d["deal"], reason=d["reason"], proof_link=d.get("link"),
@@ -444,50 +611,53 @@ async def cancel(u, c):
     await say(u, "Cancelled.", pub_home_kb())
     return ConversationHandler.END
 
+async def p_cancel_any(u, c):                         # /cancel outside the report wizard
+    c.user_data.pop("await", None)
+    await say(u, "Cancelled.", pub_home_kb())
+
 # ---- check ----
+def subject_card(s, sub):
+    reps = (s.query(Report).filter(Report.subject_id == sub.id, Report.status.in_(PUBLISHED))
+            .order_by(desc(Report.created_at)).all())
+    if not reps: return None
+    al = aliases_of(s, sub)
+    ver = sum(r.status == "VERIFIED" for r in reps)
+    head = f"🔎 <b>{esc(label(sub))}</b>" + (f"  🆔 <code>{sub.user_id}</code>" if sub.user_id else "")
+    if al: head += "\n🔄 Also seen as: " + ", ".join("@" + esc(a) for a in al[-6:])
+    lines = [head, f"⚠️ <b>{len(reps)}</b> public report(s) · {ver} verified", ""]
+    for r in reps[:8]:
+        url = post_url(r)
+        lines.append(f"• {BADGE[r.status]} · {esc(r.deal_type)} · {r.created_at:%d %b %Y}"
+                     + (f' — <a href="{url}">post</a>' if url else ""))
+    return "\n".join(lines)
+
 def lookup_text(t):
     t = t.strip().lstrip("@")
     with Session() as s:
-        out = []
-        for sub in find_subjects(s, t):
-            reps = (s.query(Report).filter(Report.subject_id == sub.id, Report.status.in_(PUBLISHED))
-                    .order_by(desc(Report.created_at)).all())
-            if not reps: continue
-            al = aliases_of(s, sub)
-            ver = sum(r.status == "VERIFIED" for r in reps)
-            head = f"🔎 <b>{esc(label(sub))}</b>" + (f"  🆔 <code>{sub.user_id}</code>" if sub.user_id else "")
-            if al: head += "\n🔄 Also seen as: " + ", ".join("@" + esc(a) for a in al[-6:])
-            lines = [head, f"⚠️ <b>{len(reps)}</b> public report(s) · {ver} verified", ""]
-            for r in reps[:8]:
-                url = post_url(r)
-                lines.append(f"• {BADGE[r.status]} · {esc(r.deal_type)} · {r.created_at:%d %b %Y}"
-                             + (f' — <a href="{url}">post</a>' if url else ""))
-            out.append("\n".join(lines))
+        out = [x for x in (subject_card(s, sub) for sub in find_subjects(s, t)) if x]
     return "\n\n".join(out) or f"✅ No public reports for <b>{esc(t)}</b>."
 
 async def p_check(u, c):
+    if not throttle(u.effective_user.id, "check", 20, 3600):
+        await say(u, "Too many lookups - try again in a bit."); return
     if c.args:
         await say(u, lookup_text(c.args[0])); return
-    c.user_data["await"] = "check"
+    c.user_data["await"] = ("check", None)
     await say(u, "Send the @username or ID to look up.")
 
-async def p_text(u, c):
-    if c.user_data.get("await") == "check" and u.message and u.message.text:
-        c.user_data.pop("await")
-        await say(u, lookup_text(u.message.text), pub_home_kb())
-
-# ---- my reports / tracking ----
+# ---- my reports / tracking / withdraw ----
 def timeline(rid, uid):
     with Session() as s:
         r = s.get(Report, rid)
-        if not r or r.reporter_id != uid: return "Report not found."
+        if not r or r.reporter_id != uid: return "Report not found.", None
         sub = s.get(Subject, r.subject_id)
         logs = s.query(StatusLog).filter_by(report_id=rid).order_by(StatusLog.at).all()
         L = [f"📄 <b>Report #{r.id}</b> on {esc(label(sub))}", f"Status: <b>{BADGE[r.status]}</b>", "", "<b>Timeline</b>"]
         for l in logs:
             L.append(f"• {l.at:%d %b %H:%M} — {BADGE.get(l.status, l.status)}" + (f" ({esc(l.note)})" if l.note else ""))
         if post_url(r): L.append(f'\n<a href="{post_url(r)}">View channel post</a>')
-        return "\n".join(L)
+        kb = Kb([[Btn("🗑 Withdraw this report", f"wd:{rid}")]]) if r.status == "PENDING" else None
+        return "\n".join(L), kb
 
 async def p_mine(u, c):
     if u.callback_query: await u.callback_query.answer()
@@ -499,21 +669,108 @@ async def p_mine(u, c):
 
 async def p_mr(u, c):
     q = u.callback_query; await q.answer()
-    await q.message.reply_text(timeline(int(q.data.split(":")[1]), u.effective_user.id),
-                               parse_mode=HTML, link_preview_options=NOPREV)
+    body, kb = timeline(int(q.data.split(":")[1]), u.effective_user.id)
+    await q.message.reply_text(body, parse_mode=HTML, reply_markup=kb, link_preview_options=NOPREV)
+
+async def p_withdraw(u, c):
+    q = u.callback_query; rid = int(q.data.split(":")[1])
+    with Session() as s:
+        r = s.get(Report, rid); mine = bool(r and r.reporter_id == u.effective_user.id)
+    if mine and claim(rid, "PENDING", "REJECTED", f"reporter:{u.effective_user.id}", "Withdrawn by reporter"):
+        await q.answer("Withdrawn"); await q.message.reply_text(f"🗑 Report #{rid} withdrawn.")
+    else:
+        await q.answer("Can't withdraw - it was already reviewed.", show_alert=True)
 
 async def p_track(u, c):
     if not c.args or not c.args[0].lstrip("#").isdigit():
         await say(u, "Usage: /track &lt;report id&gt;"); return
-    await say(u, timeline(int(c.args[0].lstrip("#")), u.effective_user.id))
+    body, kb = timeline(int(c.args[0].lstrip("#")), u.effective_user.id)
+    await say(u, body, kb)
 
 async def p_menu(u, c):
     q = u.callback_query; await q.answer()
     act = q.data.split(":")[1]
     if act == "check":
-        c.user_data["await"] = "check"; await q.message.reply_text("Send the @username or ID to look up.")
+        c.user_data["await"] = ("check", None); await q.message.reply_text("Send the @username or ID to look up.")
     elif act == "mine": await p_mine(u, c)
     elif act == "help": await p_help(u, c)
+
+# ---- reporter answers an admin question / reported user appeals ----
+async def p_answer_btn(u, c):
+    q = u.callback_query; rid = int(q.data.split(":")[1])
+    with Session() as s:
+        r = s.get(Report, rid); ok = bool(r and r.reporter_id == u.effective_user.id)
+    if not ok: await q.answer("Not your report.", show_alert=True); return
+    await q.answer()
+    c.user_data["await"] = ("answer", rid)
+    await q.message.reply_text(f"💬 Send your reply for report #{rid} (text and/or screenshots). "
+                               "Press Done when finished.", reply_markup=Kb([[Btn("✅ Done", "ad:done")]]))
+
+async def p_answer_done(u, c):
+    q = u.callback_query; await q.answer()
+    c.user_data.pop("await", None)
+    await q.message.reply_text("👍 Thanks - the admins have your reply.", reply_markup=pub_home_kb())
+
+def is_subject(s, sub, usr):
+    if sub.user_id and sub.user_id == usr.id: return "ID match ✅"
+    names = {a.lower() for a in aliases_of(s, sub)} | {(sub.username or "").lower()}
+    if usr.username and usr.username.lower() in names: return "@ match only ⚠️ (not verified by ID)"
+    return None
+
+async def p_appeal(u, c):
+    if not c.args or not c.args[0].lstrip("#").isdigit():
+        await say(u, "Usage: /appeal &lt;report id&gt;  (the number is on the channel post)"); return
+    rid = int(c.args[0].lstrip("#"))
+    with Session() as s:
+        r = s.get(Report, rid)
+        sub = s.get(Subject, r.subject_id) if r and r.status in PUBLISHED else None
+        ok = bool(sub and is_subject(s, sub, u.effective_user))
+    if not ok:
+        await say(u, "I can only take appeals on a published report from the reported account itself."); return
+    c.user_data["await"] = ("appeal", rid)
+    await say(u, f"⚖️ <b>Appeal report #{rid}</b>\nWrite your side of the story (text / links). "
+                 "An admin will review it. /cancel to abort.")
+
+async def p_incoming(u, c):
+    """Text/photos sent to the public bot outside the report wizard."""
+    st, m, usr = c.user_data.get("await"), u.message, u.effective_user
+    if not st or not m: return
+    kind, rid = st
+    body = (m.text or m.caption or "").strip()
+    if kind == "check":
+        if not m.text: return
+        c.user_data.pop("await")
+        if not throttle(usr.id, "check", 20, 3600):
+            await say(u, "Too many lookups - try again in a bit."); return
+        await say(u, lookup_text(m.text), pub_home_kb()); return
+    if kind not in ("answer", "appeal"): return
+    photo = m.photo[-1].file_id if m.photo else None
+    if photo and kind == "appeal":
+        await say(u, "Appeals accept text and links only - paste a link to your proof."); return
+    if not body and not photo: return
+    if not throttle(usr.id, "note", 12, 3600):
+        await say(u, "Too many messages - please wait a bit."); return
+    verdict = ""
+    with Session() as s:
+        r = s.get(Report, rid)
+        if not r or (kind == "answer" and r.reporter_id != usr.id):
+            c.user_data.pop("await", None); await say(u, "Report not found."); return
+        if photo and len(r.photo_ids or []) < MAX_PHOTOS:
+            r.photo_ids = list(r.photo_ids or []) + [photo]
+        if kind == "appeal":
+            verdict = is_subject(s, s.get(Subject, r.subject_id), usr) or ""
+        s.add(Note(report_id=rid, kind=kind, author_id=usr.id,
+                   author=f"@{usr.username}" if usr.username else str(usr.id), text=(body or "[photo]")[:1500]))
+        s.commit()
+    who = f"@{usr.username}" if usr.username else f"ID {usr.id}"
+    title = f"💬 <b>Reporter reply · report #{rid}</b>" if kind == "answer" else f"⚖️ <b>APPEAL · report #{rid}</b> ({esc(verdict)})"
+    await alert_admins(f"{title}\nFrom {esc(who)}\n\n{esc(body or '[photo added - see 🖼 Proofs]')}",
+                       Kb([[Btn(f"📂 Open report #{rid}", f"r:{rid}")]]))
+    if kind == "appeal":
+        c.user_data.pop("await", None)
+        await say(u, "⚖️ Appeal received. If the report's status changes you'll be told.", pub_home_kb())
+    else:
+        await say(u, "✅ Sent.", Kb([[Btn("✅ Done", "ad:done")]]))
 
 def register_public(app):
     app.add_handler(TypeHandler(Update, passive_track), group=-1)
@@ -536,18 +793,25 @@ def register_public(app):
     app.add_handler(conv)
     app.add_handler(CommandHandler("start", p_start))
     app.add_handler(CommandHandler("help", p_help))
+    app.add_handler(CommandHandler("cancel", p_cancel_any))
     app.add_handler(CommandHandler("check", p_check))
     app.add_handler(CommandHandler("my", p_mine))
     app.add_handler(CommandHandler("track", p_track))
+    app.add_handler(CommandHandler("appeal", p_appeal))
     app.add_handler(CallbackQueryHandler(p_menu, pattern=r"^pm:(check|mine|help)$"))
     app.add_handler(CallbackQueryHandler(p_mr, pattern=r"^mr:\d+$"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, p_text), group=1)
+    app.add_handler(CallbackQueryHandler(p_withdraw, pattern=r"^wd:\d+$"))
+    app.add_handler(CallbackQueryHandler(p_answer_btn, pattern=r"^ra:\d+$"))
+    app.add_handler(CallbackQueryHandler(p_answer_done, pattern=r"^ad:done$"))
+    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND & filters.ChatType.PRIVATE,
+                                   p_incoming), group=1)
 
 # ═════════════════════════ ADMIN BOT ═════════════════════════
 def admin_only(fn):
     @wraps(fn)
     async def w(u, c):
-        if u.effective_user.id not in ADMIN_IDS:
+        usr = u.effective_user
+        if not usr or usr.id not in ADMIN_IDS:
             if u.callback_query: await u.callback_query.answer("Not authorized", show_alert=True)
             elif u.effective_message: await u.effective_message.reply_text("⛔ Not authorized.")
             return
@@ -573,7 +837,8 @@ async def home(u, c):
         pubd = s.query(Report).filter(Report.status.in_(PUBLISHED)).count()
     kb = Kb([[Btn(f"📥 Pending ({pend})", "l:p:0"), Btn(f"📢 Published ({pubd})", "l:pub:0")],
              [Btn("🔎 Search", "m:search"), Btn("📊 Stats", "m:stats")],
-             [Btn("📡 Run tracker now", "m:track"), Btn("🚫 Banned reporters", "m:bans")]])
+             [Btn("📡 Run tracker now", "m:track"), Btn("🚫 Banned reporters", "m:bans")],
+             [Btn("📤 Export CSV", "m:export"), Btn("🩺 Diagnostics", "m:diag")]])
     await show(u, "🛡 <b>Admin panel</b>\nApprove, reject and manage reports with the buttons below.", kb)
 
 def list_view(kind, page):
@@ -598,6 +863,10 @@ def report_view(s, r):
     al = aliases_of(s, sub)
     others = s.query(Report).filter(Report.subject_id == sub.id, Report.id != r.id,
                                     Report.status != "REJECTED").count()
+    rs = dict(s.query(Report.status, func.count()).filter(Report.reporter_id == r.reporter_id)
+              .group_by(Report.status).all())
+    good, bad = sum(rs.get(k, 0) for k in PUBLISHED), rs.get("REJECTED", 0)
+    banned = " · 🚫 BANNED" if s.get(Banned, r.reporter_id) else ""
     track = ("🟢 live (auto-detects @ changes)" if sub.trackable else
              "🔴 can't auto-track (user must have started the public bot)" if sub.trackable is False else
              "🟡 not checked yet") if sub.user_id else "⚪ no ID yet → tap ✏️ and forward a message from them"
@@ -605,13 +874,20 @@ def report_view(s, r):
          f"👤 <b>{esc(label(sub))}</b>",
          f"🆔 {'<code>%s</code>' % sub.user_id if sub.user_id else 'unknown'}"]
     if al: L.append("🔄 Past @: " + ", ".join("@" + esc(a) for a in al))
-    L += [f"📡 {track}", f"🏷 {esc(r.deal_type)}", f"👮 Reporter: {esc(r.reporter_name)} (<code>{r.reporter_id}</code>)",
+    L += [f"📡 {track}", f"🏷 {esc(r.deal_type)}",
+          f"👮 Reporter: {esc(r.reporter_name)} (<code>{r.reporter_id}</code>)",
+          f"📈 Reporter record: {sum(rs.values())} filed · {good} approved · {bad} rejected{banned}",
           f"📅 {r.created_at:%d %b %Y %H:%M}", f"📊 Other reports on this user: {others}", "",
           f"📝 {esc(r.reason)}"]
     if r.proof_link: L.append(f'\n🔗 <a href="{esc(r.proof_link)}">Proof link</a>')
     L.append(f"🖼 {len(r.photo_ids or [])} photo(s)")
+    if r.approved_by: L.append(f"🧑‍⚖️ Approved by {esc(r.approved_by)}")
     if post_url(r): L.append(f'📢 <a href="{post_url(r)}">Channel post</a>')
     elif r.chan_msgs: L.append("📢 Posted on channel")
+    notes = s.query(Note).filter_by(report_id=r.id).order_by(desc(Note.at)).limit(3).all()
+    if notes:
+        L.append("\n<b>Latest notes</b>")
+        L += [f"{NOTE_ICON.get(n.kind, '•')} {esc(n.author)}: {esc(n.text[:200])}" for n in reversed(notes)]
 
     rows = []
     if r.status == "PENDING":
@@ -620,13 +896,16 @@ def report_view(s, r):
         rows.append([Btn(("✓ " if r.status == k else "") + k.title(), f"a:st:{r.id}:{k}") for k in PUBLISHED])
     else:
         rows.append([Btn("↩️ Restore to pending", f"a:rest:{r.id}")])
+    rows.append([Btn("❓ Ask reporter", f"a:ask:{r.id}"), Btn("📝 Add note", f"a:nt:{r.id}")])
     row2 = [Btn("✏️ Edit @ / ID", f"a:ed:{r.id}")]
     if r.photo_ids: row2.append(Btn(f"🖼 Proofs ({len(r.photo_ids)})", f"a:px:{r.id}"))
     rows.append(row2)
-    row3 = [Btn("🚫 Ban reporter", f"a:ban:{r.id}")]
+    row3 = [Btn("📜 History", f"a:hx:{r.id}"), Btn("🚫 Ban reporter", f"a:ban:{r.id}")]
     if r.status in PUBLISHED:
-        row3 = [Btn("🔄 Refresh post", f"a:rf:{r.id}"), Btn("🗑 Retract", f"a:ret:{r.id}")] + row3
-    rows.append(row3)
+        row3 = [Btn("🔄 Refresh post", f"a:rf:{r.id}"), Btn("🗑 Retract", f"a:ret:{r.id}")] + row3[:1]
+        rows.append(row3); rows.append([Btn("🚫 Ban reporter", f"a:ban:{r.id}")])
+    else:
+        rows.append(row3)
     rows.append([Btn("⏭ Next pending", f"n:{r.id}")] + HOME_BTN)
     return "\n".join(L), Kb(rows)
 
@@ -635,8 +914,8 @@ async def show_report(u, rid, note=None):
         r = s.get(Report, rid)
         if not r:
             await show(u, "Report not found.", Kb([HOME_BTN])); return
-        text, kb = report_view(s, r)
-    await show(u, (note + "\n\n" if note else "") + text, kb)
+        body, kb = report_view(s, r)
+    await show(u, (note + "\n\n" if note else "") + body, kb)
 
 async def fetch_photos(ids):
     out = []
@@ -652,12 +931,42 @@ def stats_text():
         tracked = s.query(Subject).filter(Subject.trackable.is_(True)).count()
         top = (s.query(Subject, func.count(Report.id).label("n")).join(Report, Report.subject_id == Subject.id)
                .filter(Report.status.in_(PUBLISHED)).group_by(Subject.id).order_by(desc("n")).limit(5).all())
-        week = s.query(Report).filter(Report.created_at > now().replace(hour=0, minute=0) - __import__("datetime").timedelta(days=7)).count()
+        week = s.query(Report).filter(Report.created_at > now() - timedelta(days=7)).count()
+        oldest = aware(s.query(func.min(Report.created_at)).filter(Report.status == "PENDING").scalar())
     L = ["📊 <b>Stats</b>", ""] + [f"{BADGE[k]}: {by.get(k, 0)}" for k in BADGE]
     L += ["", f"👥 People tracked: {subs} ({tracked} live)", f"🆕 Reports last 7 days: {week}"]
+    if oldest: L.append(f"⏱ Oldest pending: {int((now() - oldest).total_seconds() // 3600)}h")
     if top:
         L += ["", "<b>Most reported</b>"] + [f"• {esc(label(sub))} — {n}" for sub, n in top]
     return "\n".join(L)
+
+def safe_cell(x):
+    x = "" if x is None else str(x)
+    return "'" + x if x and x[0] in "=+-@\t\r" else x      # block CSV formula injection
+
+def export_csv():
+    out = io.StringIO(); w = csv.writer(out)
+    w.writerow(["id", "status", "target_username", "target_id", "deal", "reporter_id", "reporter",
+                "created_at", "approved_by", "published_at", "proof_link", "photos", "reason"])
+    with Session() as s:
+        for r, sub in (s.query(Report, Subject).join(Subject, Report.subject_id == Subject.id)
+                       .order_by(Report.id)):
+            w.writerow([safe_cell(x) for x in (r.id, r.status, sub.username, sub.user_id, r.deal_type,
+                        r.reporter_id, r.reporter_name, r.created_at, r.approved_by, r.published_at,
+                        r.proof_link, len(r.photo_ids or []), r.reason)])
+    return out.getvalue().encode("utf-8-sig")
+
+async def diagnostics():
+    ok, msg = await channel_check()
+    with Session() as s:
+        pend = s.query(Report).filter_by(status="PENDING").count()
+    tr = STATE["track_res"]
+    up = int(time.time() - STARTED)
+    return ("🩺 <b>Diagnostics</b>\n\n" + ("🟢 " if ok else "🔴 ") + esc(msg) +
+            f"\n🤖 Public bot: @{esc(PUB_USERNAME)}\n👮 Admins: {len(ADMIN_IDS)}\n📥 Pending: {pend}\n"
+            f"📡 Tracker: " + (f"last run {STATE['track_at']:%H:%M} UTC - {tr[0]}/{tr[2]} reachable"
+                               if tr else "hasn't run yet") +
+            f"\n⏱ Uptime: {up // 3600}h {up % 3600 // 60}m · DB: {engine.dialect.name}")
 
 @admin_only
 async def a_start(u, c):
@@ -668,9 +977,17 @@ async def a_cancel(u, c):
     c.user_data.pop("await", None); await u.message.reply_text("Cancelled. /menu")
 
 @admin_only
+async def a_export(u, c):
+    await u.effective_message.reply_document(io.BytesIO(export_csv()), filename="reports.csv")
+
+def confirm_kb(yes, rid, label_yes):
+    return Kb([[Btn(label_yes, yes), Btn("↩️ Cancel", f"r:{rid}")]])
+
+@admin_only
 async def a_cb(u, c):
     q = u.callback_query; await q.answer()
     p = q.data.split(":"); k = p[0]
+    me = f"admin:{u.effective_user.id}"
 
     if k == "m":
         act = p[1]
@@ -679,6 +996,9 @@ async def a_cb(u, c):
             c.user_data["await"] = ("search", None)
             await show(u, "🔎 Send @username, numeric ID or part of a username.", Kb([HOME_BTN]))
         elif act == "stats": await show(u, stats_text(), Kb([HOME_BTN]))
+        elif act == "diag": await show(u, await diagnostics(), Kb([HOME_BTN]))
+        elif act == "export":
+            await c.bot.send_document(u.effective_chat.id, io.BytesIO(export_csv()), filename="reports.csv")
         elif act == "track":
             await show(u, "📡 Checking all tracked users…")
             n, ch = await track_all()
@@ -690,7 +1010,7 @@ async def a_cb(u, c):
             await show(u, "🚫 <b>Banned reporters</b>" + ("" if ids else "\n\nNone."), kb)
 
     elif k == "l":
-        text, kb = list_view(p[1], int(p[2])); await show(u, text, kb)
+        body, kb = list_view(p[1], int(p[2])); await show(u, body, kb)
 
     elif k == "r": await show_report(u, int(p[1]))
 
@@ -717,56 +1037,67 @@ async def a_cb(u, c):
             photos = list(r.photo_ids or [])
 
         if act == "ok":
-            if status in PUBLISHED: await show_report(u, rid, "Already posted."); return
+            if not claim(rid, "PENDING", "VERIFIED", me, "Approved"):
+                await show_report(u, rid, "ℹ️ Already handled by someone else."); return
             with Session() as s:
-                r = s.get(Report, rid); log_status(s, r, "VERIFIED", f"admin:{u.effective_user.id}", "Approved"); s.commit()
+                s.get(Report, rid).approved_by = me; s.commit()
             try:
                 await publish(rid)
             except TelegramError as e:
-                with Session() as s:
-                    r = s.get(Report, rid); log_status(s, r, "PENDING", "system", "Post failed"); s.commit()
+                claim(rid, "VERIFIED", "PENDING", "system", "Post failed")
                 await show(u, f"❌ Couldn't post to the channel: <code>{esc(e)}</code>\n\nMake the <b>public bot</b> an "
-                              "admin of the channel with permission to post, and check CHANNEL_ID.",
+                              "admin of the channel with permission to post, and check CHANNEL_ID (see 🩺 Diagnostics).",
                            Kb([[Btn("↩️ Back", f"r:{rid}")], HOME_BTN])); return
             await refresh_subject(sub_id)
-            await tell(reporter, f"✅ Your report #{rid} was <b>approved</b> and posted on the channel.")
+            with Session() as s: link = post_url(s.get(Report, rid))
+            await tell(reporter, f"✅ Your report #{rid} was <b>approved</b> and posted on the channel."
+                                 + (f'\n<a href="{link}">View post</a>' if link else ""))
             await show_report(u, rid, "✅ Approved & posted.")
 
         elif act == "rj":
             kb = Kb([[Btn(v, f"a:rjr:{rid}:{kk}")] for kk, v in REJECT_REASONS.items()]
-                    + [[Btn("No reason", f"a:rjr:{rid}:none")], [Btn("↩️ Back", f"r:{rid}")]])
+                    + [[Btn("✍️ Custom reason", f"a:rjc:{rid}"), Btn("No reason", f"a:rjr:{rid}:none")],
+                       [Btn("↩️ Back", f"r:{rid}")]])
             await show(u, f"❌ Reject report #{rid} — pick a reason (sent to the reporter):", kb)
+
+        elif act == "rjc":
+            c.user_data["await"] = ("rejc", rid)
+            await show(u, f"✍️ Send the rejection reason for report #{rid}.\n/cancel to abort.",
+                       Kb([[Btn("↩️ Back", f"r:{rid}")]]))
 
         elif act == "rjr":
             reason = REJECT_REASONS.get(p[3])
-            with Session() as s:
-                r = s.get(Report, rid); log_status(s, r, "REJECTED", f"admin:{u.effective_user.id}", reason); s.commit()
+            if not claim(rid, "PENDING", "REJECTED", me, reason):
+                await show_report(u, rid, "ℹ️ Already handled."); return
             await tell(reporter, f"❌ Your report #{rid} was rejected." + (f"\nReason: {esc(reason)}" if reason else ""))
             await show_report(u, rid, "❌ Rejected.")
 
         elif act == "st":
             new = p[3]
-            if new not in PUBLISHED or status not in PUBLISHED: return
-            with Session() as s:
-                r = s.get(Report, rid); log_status(s, r, new, f"admin:{u.effective_user.id}"); s.commit()
+            if new not in PUBLISHED or status not in PUBLISHED or new == status: return
+            if not claim(rid, PUBLISHED, new, me): return
             await refresh_subject(sub_id)
             await tell(reporter, f"ℹ️ Report #{rid} status changed to <b>{BADGE[new]}</b>.")
+            await notify_appellants(rid, f"ℹ️ The report #{rid} you appealed is now <b>{BADGE[new]}</b>.")
             await show_report(u, rid, f"Status → {BADGE[new]} (channel post updated)")
 
         elif act == "rf":
             await refresh_subject(sub_id); await show_report(u, rid, "🔄 Post(s) refreshed.")
 
         elif act == "ret":
+            await show(u, f"🗑 Delete report #{rid} from the channel and mark it rejected?",
+                       confirm_kb(f"a:rety:{rid}", rid, "Yes, retract"))
+
+        elif act == "rety":
             await retract(rid)
-            with Session() as s:
-                r = s.get(Report, rid); log_status(s, r, "REJECTED", f"admin:{u.effective_user.id}", "Retracted"); s.commit()
+            claim(rid, PUBLISHED, "REJECTED", me, "Retracted")
             await refresh_subject(sub_id)
             await tell(reporter, f"ℹ️ Report #{rid} was removed from the channel.")
+            await notify_appellants(rid, f"✅ The report #{rid} you appealed was removed from the channel.")
             await show_report(u, rid, "🗑 Retracted & deleted from channel.")
 
         elif act == "rest":
-            with Session() as s:
-                r = s.get(Report, rid); log_status(s, r, "PENDING", f"admin:{u.effective_user.id}", "Restored"); s.commit()
+            claim(rid, "REJECTED", "PENDING", me, "Restored")
             await show_report(u, rid, "↩️ Restored to pending.")
 
         elif act == "ed":
@@ -775,16 +1106,37 @@ async def a_cb(u, c):
                           "<b>forward a message from the user</b> (gets both ID + current @).\n/cancel to abort.",
                        Kb([[Btn("↩️ Back", f"r:{rid}")]]))
 
+        elif act == "ask":
+            c.user_data["await"] = ("ask", rid)
+            await show(u, f"❓ Type your question for the reporter of #{rid}. They can reply with text and screenshots.\n"
+                          "/cancel to abort.", Kb([[Btn("↩️ Back", f"r:{rid}")]]))
+
+        elif act == "nt":
+            c.user_data["await"] = ("note", rid)
+            await show(u, f"📝 Type an internal note for report #{rid} (only admins see it).\n/cancel to abort.",
+                       Kb([[Btn("↩️ Back", f"r:{rid}")]]))
+
+        elif act == "hx":
+            with Session() as s:
+                logs = s.query(StatusLog).filter_by(report_id=rid).order_by(desc(StatusLog.at)).limit(25).all()
+            body = f"📜 <b>History · report #{rid}</b>\n\n" + "\n".join(
+                f"• {l.at:%d %b %H:%M} · {BADGE.get(l.status, l.status)} · {esc(l.by)}"
+                + (f" — {esc(l.note)}" if l.note else "") for l in reversed(logs))
+            await show(u, body, Kb([[Btn("↩️ Back", f"r:{rid}")]]))
+
         elif act == "px":
             try:
                 imgs = await fetch_photos(photos)
-                media = [InputMediaPhoto(b) for b in imgs[:10]]
-                if len(media) == 1: await c.bot.send_photo(u.effective_chat.id, media[0].media)
-                else: await c.bot.send_media_group(u.effective_chat.id, media)
+                if len(imgs) == 1: await c.bot.send_photo(u.effective_chat.id, imgs[0])
+                else: await c.bot.send_media_group(u.effective_chat.id, [InputMediaPhoto(b) for b in imgs[:10]])
             except TelegramError as e:
                 await c.bot.send_message(u.effective_chat.id, f"Couldn't load proofs: {e}")
 
         elif act == "ban":
+            await show(u, f"🚫 Ban reporter <code>{reporter}</code> from filing reports?",
+                       confirm_kb(f"a:bany:{rid}", rid, "Yes, ban"))
+
+        elif act == "bany":
             with Session() as s:
                 if not s.get(Banned, reporter): s.add(Banned(user_id=reporter)); s.commit()
             await show_report(u, rid, f"🚫 Reporter {reporter} banned from filing reports.")
@@ -796,15 +1148,19 @@ async def a_text(u, c):
         await home(u, c); return
     kind, rid = st
     m = u.message
+    me = f"admin:{u.effective_user.id}"
+    body = (m.text or "").strip()
+
     if kind == "search":
         c.user_data.pop("await")
-        t = (m.text or "").strip().lstrip("@")
+        t = body.lstrip("@")
         with Session() as s:
             q = s.query(Report).join(Subject, Report.subject_id == Subject.id)
             if t.isdigit():
                 q = q.filter((Subject.user_id == int(t)) | (Report.id == int(t)))
             else:
-                ids = [x.subject_id for x in s.query(Alias).filter(Alias.username.ilike(f"%{t}%"))]
+                pat = t.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                ids = [x.subject_id for x in s.query(Alias).filter(Alias.username.ilike(f"%{pat}%", escape="\\"))]
                 q = q.filter(Subject.id.in_(ids or [0]))
             rows = q.order_by(desc(Report.id)).limit(15).all()
             btns = [[Btn(f"#{r.id} {label(s.get(Subject, r.subject_id))} · {BADGE[r.status]}", f"r:{r.id}")] for r in rows]
@@ -830,16 +1186,47 @@ async def a_text(u, c):
         await refresh_subject(sid)
         await show_report(u, rid, "✏️ Identity updated" + (f" (@{esc(old)} → @{esc(uname)})" if old else "") +
                                   " — channel posts refreshed.")
+        return
+
+    if not body:
+        await show(u, "Please send text."); return
+    c.user_data.pop("await")
+
+    if kind == "ask":
+        with Session() as s:
+            r = s.get(Report, rid); reporter = r.reporter_id
+            s.add(Note(report_id=rid, kind="admin", author=me, text="Asked reporter: " + body[:1000])); s.commit()
+        await tell(reporter, f"❓ <b>An admin has a question about your report #{rid}</b>\n\n{esc(body)}",
+                   Kb([[Btn("💬 Reply", f"ra:{rid}")]]))
+        await show_report(u, rid, "❓ Question sent to the reporter.")
+
+    elif kind == "note":
+        with Session() as s:
+            s.add(Note(report_id=rid, kind="admin", author=me, text=body[:1500])); s.commit()
+        await show_report(u, rid, "📝 Note saved.")
+
+    elif kind == "rejc":
+        reason = body[:180]
+        if not claim(rid, "PENDING", "REJECTED", me, reason):
+            await show_report(u, rid, "ℹ️ Already handled."); return
+        with Session() as s: reporter = s.get(Report, rid).reporter_id
+        await tell(reporter, f"❌ Your report #{rid} was rejected.\nReason: {esc(reason)}")
+        await show_report(u, rid, "❌ Rejected.")
 
 def register_admin(app):
     app.add_handler(CommandHandler(["start", "menu"], a_start))
     app.add_handler(CommandHandler("cancel", a_cancel))
+    app.add_handler(CommandHandler("export", a_export))
     app.add_handler(CallbackQueryHandler(a_cb))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, a_text))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, a_text))
 
 # ═════════════════════════ run ═════════════════════════
 async def on_error(u, c):
     log.error("handler error", exc_info=c.error)
+    if isinstance(c.error, NetworkError): return                 # transient network hiccup
+    if time.time() - STATE["err_at"] > 600:                      # at most one alert / 10 min
+        STATE["err_at"] = time.time()
+        await alert_admins(f"⚠️ <b>Bot error</b>\n<code>{esc(repr(c.error)[:300])}</code>")
 
 def health_server():
     port = os.getenv("PORT")
@@ -851,7 +1238,9 @@ def health_server():
 
 async def main():
     global pub, adm, PUB_USERNAME
-    health_server()
+    health_server()                                              # answer health checks while we wait for the lock
+    init_db()
+    lock = await asyncio.to_thread(acquire_lock)
     pub = Application.builder().token(PUB_TOKEN).build()
     adm = Application.builder().token(ADM_TOKEN).build()
     register_public(pub); register_admin(adm)
@@ -861,18 +1250,24 @@ async def main():
     PUB_USERNAME = pub.bot.username
     await pub.bot.set_my_commands([BotCommand("start", "Menu"), BotCommand("report", "File a report"),
                                    BotCommand("check", "Look up a user"), BotCommand("my", "My reports"),
-                                   BotCommand("track", "Track a report by ID"), BotCommand("cancel", "Cancel")])
-    await adm.bot.set_my_commands([BotCommand("menu", "Admin panel"), BotCommand("cancel", "Cancel action")])
+                                   BotCommand("track", "Track a report by ID"),
+                                   BotCommand("appeal", "Appeal a report about you"), BotCommand("cancel", "Cancel")])
+    await adm.bot.set_my_commands([BotCommand("menu", "Admin panel"), BotCommand("export", "Export reports CSV"),
+                                   BotCommand("cancel", "Cancel action")])
     for a in (pub, adm):
         await a.updater.start_polling(drop_pending_updates=True)
+    ok, msg = await channel_check()
+    (log.info if ok else log.error)("%s", msg)
+    if not ok: await alert_admins("⚠️ <b>Channel problem</b>\n" + esc(msg))
     log.info("Running. Public bot @%s | admins: %s", PUB_USERNAME, sorted(ADMIN_IDS))
-    task = asyncio.create_task(tracker_loop())
+    tasks = [asyncio.create_task(tracker_loop()), asyncio.create_task(reminder_loop())]
     try:
         await asyncio.Event().wait()
     finally:
-        task.cancel()
+        for t in tasks: t.cancel()
         for a in (pub, adm):
             await a.updater.stop(); await a.stop(); await a.shutdown()
+        if lock is not None: lock.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
