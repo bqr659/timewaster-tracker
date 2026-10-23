@@ -1,8 +1,7 @@
 import os, uuid, asyncio, threading
 from datetime import datetime, timezone
 
-import httpx
-from flask import Flask, jsonify, request, send_from_directory, Response, abort
+from flask import Flask, jsonify, request, send_from_directory
 from sqlalchemy import create_engine, Column, String, Text, DateTime, JSON, or_
 from sqlalchemy.orm import declarative_base, sessionmaker
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
@@ -65,17 +64,6 @@ def api_reports():
         rows = query.order_by(Report.created_at.desc()).limit(200).all()
         return jsonify([r.to_dict() for r in rows])
 
-@app.get("/media/<file_id>")
-def media(file_id):
-    """Proxy Telegram photos so the bot token never reaches the browser."""
-    base = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile"
-    info = httpx.get(base, params={"file_id": file_id}, timeout=15).json()
-    if not info.get("ok"):
-        abort(404)
-    r = httpx.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{info['result']['file_path']}", timeout=30)
-    return Response(r.content, mimetype=r.headers.get("content-type", "image/jpeg"),
-                    headers={"Cache-Control": "public, max-age=86400"})
-
 # ---------- Telegram bot ----------
 TARGET, DEAL, REASON, PROOF = range(4)
 
@@ -103,37 +91,42 @@ async def got_deal(u, c):
 async def got_reason(u, c):
     c.user_data["reason"] = u.message.text.strip()[:1500]
     c.user_data["proofs"] = []
-    await u.message.reply_text("Send proof: links and/or screenshots (one or many).\nSend /done when finished, or /skip for none.")
+    await u.message.reply_text("Now create a Telegram channel, put ALL your proof in it (screenshots, chats, receipts), then send me the channel link here (for example https://t.me/yourchannel).\n\nNo proof? Send /skip.")
     return PROOF
 
 async def got_proof(u, c):
-    m, proofs = u.message, c.user_data.setdefault("proofs", [])
-    if m.photo:
-        proofs.append(f"{BASE_URL}/media/{m.photo[-1].file_id}")
-    elif m.text and m.text.startswith(("http://", "https://")):
-        proofs.append(m.text.strip())
-    else:
-        await m.reply_text("Send a link (http/https) or a photo, then /done.")
+    m = u.message
+    link = (m.text or "").strip()
+    if link.lower().startswith(("t.me/", "telegram.me/")):
+        link = "https://" + link
+    if not link.lower().startswith(("http://", "https://")) or " " in link:
+        await m.reply_text("Please send the channel link, like https://t.me/yourchannel, or /skip.")
         return PROOF
-    await m.reply_text(f"Added ({len(proofs)}). Send more or /done.")
-    return PROOF
+    c.user_data["proofs"] = [link]
+    return await finish(u, c)
+
+def detail(r):
+    return (f"ID: {r.id}\nTarget: @{r.target_username}\nReported by: {r.reported_by}\n"
+            f"Type: {r.deal_type}\nStatus: {r.status}\nReason: {r.reason}\n"
+            f"Proof: {', '.join(r.proof_urls or []) or 'none'}")
 
 async def finish(u, c):
     d, user = c.user_data, u.effective_user
-    rid = str(uuid.uuid4())
     t = d["target"]
+    rep = Report(id=str(uuid.uuid4()), target_username=t, target_id=t if t.isdigit() else None,
+                 reported_by=f"@{user.username}" if user.username else str(user.id),
+                 reason=d["reason"], deal_type=d["deal"],
+                 proof_urls=d.get("proofs", []), status="PENDING")
     with Session() as s:
-        s.add(Report(id=rid, target_username=t, target_id=t if t.isdigit() else None,
-                     reported_by=f"@{user.username}" if user.username else str(user.id),
-                     reason=d["reason"], deal_type=d["deal"],
-                     proof_urls=d.get("proofs", []), status="PENDING"))
+        s.add(rep)
         s.commit()
     await u.message.reply_text(
-        f"✅ Report submitted.\n\nID: {rid}\nStatus: PENDING (visible publicly once an admin reviews it)\n"
-        f"Track it: {BASE_URL}/#{rid}", reply_markup=ReplyKeyboardRemove())
+        f"✅ Report submitted.\n\nID: {rep.id}\nStatus: PENDING (visible publicly once an admin reviews it)\n"
+        f"Track it: {BASE_URL}/#{rep.id}", reply_markup=ReplyKeyboardRemove())
     for aid in ADMIN_IDS:
         try:
-            await c.bot.send_message(aid, f"New report {rid[:8]} on @{t} ({d['deal']}).\n/setstatus {rid[:8]} VERIFIED")
+            await c.bot.send_message(aid, "🆕 New report\n\n" + detail(rep) +
+                f"\n\n/setstatus {rep.id[:8]} VERIFIED\n/reject {rep.id[:8]}")
         except Exception:
             pass
     c.user_data.clear()
@@ -158,6 +151,44 @@ async def setstatus(u, c):
         rows[0].status = c.args[1].upper()
         s.commit()
     await u.message.reply_text("Updated.")
+
+def find_one(s, prefix):
+    rows = s.query(Report).filter(Report.id.like(f"{prefix}%")).all()
+    return rows[0] if len(rows) == 1 else None
+
+async def pending(u, c):
+    if str(u.effective_user.id) not in ADMIN_IDS:
+        return
+    with Session() as s:
+        rows = s.query(Report).filter(Report.status == "PENDING").order_by(Report.created_at).limit(20).all()
+    if not rows:
+        await u.message.reply_text("No pending reports.")
+        return
+    await u.message.reply_text("Pending reports:\n\n" + "\n".join(
+        f"{r.id[:8]}  @{r.target_username}  ({r.deal_type})" for r in rows) +
+        "\n\nOpen one with /view <id>")
+
+async def view(u, c):
+    if str(u.effective_user.id) not in ADMIN_IDS:
+        return
+    with Session() as s:
+        r = find_one(s, c.args[0]) if c.args else None
+    if not r:
+        await u.message.reply_text("Usage: /view <id-prefix> (no unique match found)")
+        return
+    await u.message.reply_text(detail(r) + f"\n\n/setstatus {r.id[:8]} VERIFIED\n/reject {r.id[:8]}")
+
+async def reject(u, c):
+    if str(u.effective_user.id) not in ADMIN_IDS:
+        return
+    with Session() as s:
+        r = find_one(s, c.args[0]) if c.args else None
+        if not r:
+            await u.message.reply_text("Usage: /reject <id-prefix> (no unique match found)")
+            return
+        s.delete(r)
+        s.commit()
+    await u.message.reply_text("Report rejected and deleted.")
 
 async def check(u, c):
     if not c.args:
@@ -185,8 +216,8 @@ def run_bot():
             TARGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_target)],
             DEAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_deal)],
             REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_reason)],
-            PROOF: [CommandHandler(["done", "skip"], finish),
-                    MessageHandler((filters.PHOTO | filters.TEXT) & ~filters.COMMAND, got_proof)],
+            PROOF: [CommandHandler("skip", finish),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, got_proof)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
@@ -194,6 +225,9 @@ def run_bot():
     bot.add_handler(CommandHandler("start", start))
     bot.add_handler(CommandHandler("check", check))
     bot.add_handler(CommandHandler("setstatus", setstatus))
+    bot.add_handler(CommandHandler("pending", pending))
+    bot.add_handler(CommandHandler("view", view))
+    bot.add_handler(CommandHandler("reject", reject))
     bot.run_polling(stop_signals=None, close_loop=False)
 
 if os.getenv("RUN_BOT", "1") == "1":
