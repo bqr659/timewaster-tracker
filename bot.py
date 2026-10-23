@@ -60,6 +60,10 @@ COOLDOWN_MIN = int(os.getenv("REPORT_COOLDOWN_MIN", "10"))
 MAX_PER_DAY = int(os.getenv("MAX_REPORTS_PER_DAY", "5"))
 REMIND_H = int(os.getenv("REMIND_AFTER_HOURS", "24"))
 MAX_PHOTOS = 8
+POST_WORD = os.getenv("POST_WORD", "timewaster").strip() or "timewaster"     # "...marked as a <word>."
+BANNER_URL = os.getenv("BANNER_URL", "").strip()                            # optional https image URL
+BANNER_FILE = os.getenv("BANNER_FILE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "banner.png")
+_BANNER = {"id": None}                                                      # cached Telegram file_id
 LOCK_KEY = 7340117                                  # postgres advisory lock id (single-instance guard)
 
 DEALS = ["Account Trade", "Middleman Deal", "Service", "Other"]
@@ -320,49 +324,61 @@ async def channel_check():
     return True, "Channel OK (public bot can post, edit and delete)."
 
 # ───────────────────────── channel posting ─────────────────────────
-def render_post(s, r, limit):
+def render_post(s, r):
+    """Compact channel caption:  ❌ User @name (123456) has been marked as a timewaster."""
     sub = s.get(Subject, r.subject_id)
-    al = aliases_of(s, sub)
-    base = s.query(Report).filter(Report.subject_id == sub.id, Report.status.in_(PUBLISHED))
-    total, ver = base.count(), base.filter(Report.status == "VERIFIED").count()
+    who = "User"
+    if sub.username: who += f' <a href="https://t.me/{esc(sub.username)}">@{esc(sub.username)}</a>'
+    if sub.user_id: who += f" (<code>{sub.user_id}</code>)"
+    if r.status == "DISPUTED":
+        return f"⚠️ {who} has been reported as a {esc(POST_WORD)} — <b>status: disputed</b>."
+    if r.status == "RESOLVED":
+        return f"🟢 {who} — report <b>resolved</b>."
+    return f"❌ {who} has been marked as a {esc(POST_WORD)}."
 
-    def build(reason):
-        L = [f"🚨 <b>TIMEWASTER REPORT #{r.id}</b>", f"Status: <b>{BADGE[r.status]}</b>", "",
-             f"👤 <b>{esc(label(sub))}</b>"]
-        if sub.user_id: L.append(f"🆔 <code>{sub.user_id}</code>")
-        if al: L.append("🔄 Also seen as: " + ", ".join("@" + esc(a) for a in al[-5:]))
-        L += [f"🏷 {esc(r.deal_type)}", f"📅 {r.created_at:%d %b %Y}", "", f"📝 {esc(reason)}"]
-        if r.proof_link: L.append(f'\n🔗 <a href="{esc(r.proof_link)}">Proof channel</a>')
-        L.append(f"\n📊 Reports on this user: {total} ({ver} verified)")
-        if PUB_USERNAME:
-            L.append(f'🔍 <a href="https://t.me/{PUB_USERNAME}?start=r{r.id}">Full history</a> · '
-                     f"🤖 @{PUB_USERNAME} · ⚖️ Disagree? /appeal {r.id}")
-        return "\n".join(L)
+def post_kb(s, r, profile=True):
+    """[View Profile] [View Full Report] buttons under the channel post."""
+    sub = s.get(Subject, r.subject_id)
+    row = []
+    if profile:
+        url = (f"https://t.me/{sub.username}" if sub.username
+               else f"tg://user?id={sub.user_id}" if sub.user_id else None)
+        if url: row.append(_IKB("View Profile", url=url))
+    if PUB_USERNAME:
+        row.append(_IKB("View Full Report", url=f"https://t.me/{PUB_USERNAME}?start=r{r.id}"))
+    return Kb([row]) if row else None
 
-    reason = r.reason or ""
-    out = build(reason)
-    while len(out) > limit and len(reason) > 21:
-        reason = reason[:max(20, len(reason) - (len(out) - limit) - 5)].rstrip() + "…"
-        out = build(reason)
-    return out
+def banner_source():
+    if _BANNER["id"]: return _BANNER["id"]
+    if BANNER_URL: return BANNER_URL
+    try:
+        with open(BANNER_FILE, "rb") as f: return f.read()
+    except OSError:
+        return None
 
 async def publish(rid):
     with Session() as s:
         r = s.get(Report, rid)
-        photos = list(r.photo_ids or [])
-        body = render_post(s, r, 1024 if photos else 4000)
-    if not photos:
-        ms = [await tg(pub.bot.send_message, CHANNEL, body, parse_mode=HTML, link_preview_options=NOPREV)]
-    elif len(photos) == 1:
-        ms = [await tg(pub.bot.send_photo, CHANNEL, photos[0], caption=body, parse_mode=HTML)]
-    else:
-        media = [InputMediaPhoto(photos[0], caption=body, parse_mode=HTML)] + \
-                [InputMediaPhoto(p) for p in photos[1:10]]
-        ms = await tg(pub.bot.send_media_group, CHANNEL, media=media)
+        body, kbs = render_post(s, r), (post_kb(s, r), post_kb(s, r, profile=False))
+    img = banner_source()
+
+    async def send(kb):
+        if img is None:
+            return await tg(pub.bot.send_message, CHANNEL, body, parse_mode=HTML,
+                            link_preview_options=NOPREV, reply_markup=kb)
+        m = await tg(pub.bot.send_photo, CHANNEL, img, caption=body, parse_mode=HTML, reply_markup=kb)
+        if m.photo: _BANNER["id"] = m.photo[-1].file_id
+        return m
+
+    try:
+        m = await send(kbs[0])
+    except BadRequest as e:                 # e.g. profile button refused by the user's privacy settings
+        if "button" not in str(e).lower(): raise
+        m = await send(kbs[1])
     with Session() as s:
         r = s.get(Report, rid)
-        r.chan_msgs = [m.message_id for m in ms]
-        r.chan_has_photo = bool(photos)
+        r.chan_msgs = [m.message_id]
+        r.chan_has_photo = img is not None
         r.published_at = now()
         s.commit()
 
@@ -370,18 +386,24 @@ async def refresh_post(rid):
     with Session() as s:
         r = s.get(Report, rid)
         if not r or not r.chan_msgs: return
-        photo, mid = r.chan_has_photo, r.chan_msgs[0]
-        body = render_post(s, r, 1024 if photo else 4000)
-    try:
-        if photo:
-            await tg(pub.bot.edit_message_caption, CHANNEL, mid, caption=body, parse_mode=HTML)
-        else:
-            await tg(pub.bot.edit_message_text, body, chat_id=CHANNEL, message_id=mid,
-                     parse_mode=HTML, link_preview_options=NOPREV)
-    except BadRequest as e:
-        if "not modified" not in str(e).lower(): log.warning("refresh #%s: %s", rid, e)
-    except TelegramError as e:
-        log.warning("refresh #%s: %s", rid, e)
+        photo, mid, album = r.chan_has_photo, r.chan_msgs[0], len(r.chan_msgs) > 1
+        body, kbs = render_post(s, r), (post_kb(s, r), post_kb(s, r, profile=False))
+    for i, kb in enumerate(kbs):
+        if album: kb = None                 # old multi-photo posts cannot carry buttons
+        try:
+            if photo:
+                await tg(pub.bot.edit_message_caption, CHANNEL, mid, caption=body, parse_mode=HTML, reply_markup=kb)
+            else:
+                await tg(pub.bot.edit_message_text, body, chat_id=CHANNEL, message_id=mid,
+                         parse_mode=HTML, link_preview_options=NOPREV, reply_markup=kb)
+            return
+        except BadRequest as e:
+            m = str(e).lower()
+            if "not modified" in m: return
+            if "button" in m and i == 0 and not album: continue
+            log.warning("refresh #%s: %s", rid, e); return
+        except TelegramError as e:
+            log.warning("refresh #%s: %s", rid, e); return
 
 async def refresh_subject(sub_id):
     with Session() as s:
@@ -490,12 +512,25 @@ async def say(u, text, kb=None):
 async def p_start(u, c):
     c.user_data.pop("await", None)
     arg = c.args[0] if c.args else ""
-    if len(arg) > 1 and arg[0] == "r" and arg[1:].isdigit():        # deep link from a channel post
+    if len(arg) > 1 and arg[0] == "r" and arg[1:].isdigit():        # "View Full Report" from a channel post
         with Session() as s:
             r = s.get(Report, int(arg[1:]))
-            sub = s.get(Subject, r.subject_id) if r and r.status in PUBLISHED else None
-            card = subject_card(s, sub) if sub else None
-        if card: await say(u, card, pub_home_kb()); return
+            if r and r.status in PUBLISHED:
+                card, photos = report_card(s, r), list(r.photo_ids or [])
+                more = subject_card(s, s.get(Subject, r.subject_id))
+                multi = s.query(Report).filter(Report.subject_id == r.subject_id, Report.status.in_(PUBLISHED)).count() > 1
+            else:
+                card = None
+        if card:
+            await say(u, card, pub_home_kb())
+            try:
+                if len(photos) == 1: await c.bot.send_photo(u.effective_chat.id, photos[0], caption="📸 Proof")
+                elif photos: await c.bot.send_media_group(u.effective_chat.id,
+                                                          [InputMediaPhoto(p) for p in photos[:10]])
+            except TelegramError as e:
+                log.warning("proof send failed for #%s: %s", arg[1:], e)
+            if multi and more: await say(u, more)
+            return
     await say(u, "⏳ <b>Timewaster Tracker</b>\nReport flakers, check who you're dealing with, "
                  "and follow your reports.", pub_home_kb())
 
@@ -646,6 +681,21 @@ async def p_cancel_any(u, c):                         # /cancel outside the repo
     c.user_data.pop("await", None)
     await say(u, "Cancelled.", pub_home_kb())
 
+def report_card(s, r):
+    """What 'View Full Report' shows: every detail of one published report."""
+    sub = s.get(Subject, r.subject_id)
+    al = aliases_of(s, sub)
+    n = s.query(Report).filter(Report.subject_id == sub.id, Report.status.in_(PUBLISHED)).count()
+    L = [f"📄 <b>Full report #{r.id}</b>", f"Status: <b>{BADGE[r.status]}</b>", "",
+         f"👤 <b>{esc(label(sub))}</b>"]
+    if sub.user_id: L.append(f"🆔 <code>{sub.user_id}</code>")
+    if al: L.append("🔄 Also seen as: " + ", ".join("@" + esc(a) for a in al[-5:]))
+    L += [f"🏷 {esc(r.deal_type)}", f"📅 {r.created_at:%d %b %Y}", "", f"📝 {esc(r.reason)}"]
+    if r.proof_link: L.append(f'\n🔗 <a href="{esc(r.proof_link)}">Proof channel</a>')
+    L.append(f"\n📊 Public reports on this user: {n}")
+    L.append(f"⚖️ Disagree? /appeal {r.id}")
+    return "\n".join(L)
+
 # ---- check ----
 def subject_card(s, sub):
     reps = (s.query(Report).filter(Report.subject_id == sub.id, Report.status.in_(PUBLISHED))
@@ -750,7 +800,7 @@ def is_subject(s, sub, usr):
 
 async def p_appeal(u, c):
     if not c.args or not c.args[0].lstrip("#").isdigit():
-        await say(u, "Usage: /appeal &lt;report id&gt;  (the number is on the channel post)"); return
+        await say(u, "Usage: /appeal &lt;report id&gt;  (the number is in the full report)"); return
     rid = int(c.args[0].lstrip("#"))
     with Session() as s:
         r = s.get(Report, rid)
