@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Timewaster Tracker</title>
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen">
+<div class="max-w-3xl mx-auto p-4">
+  <h1 class="text-3xl font-bold mt-6">⏳ Timewaster Tracker</h1>
+  <p class="text-slate-400 mb-4">Reported deal flakers. File reports via the Telegram bot with /report.</p>
+  <div class="flex gap-2 mb-4">
+    <input id="q" placeholder="Search @username or ID" class="flex-1 bg-slate-900 border border-slate-700 rounded px-3 py-2">
+    <select id="status" class="bg-slate-900 border border-slate-700 rounded px-2">
+      <option value="">All</option><option>VERIFIED</option><option>DISPUTED</option><option>RESOLVED</option>
+    </select>
+  </div>
+  <div id="list" class="space-y-3"></div>
+</div>
+<script>
+const COLORS = {VERIFIED:"bg-red-600", DISPUTED:"bg-yellow-600", RESOLVED:"bg-green-700", PENDING:"bg-slate-600"};
+const list = document.getElementById("list"), q = document.getElementById("q"), st = document.getElementById("status");
+q.value = new URLSearchParams(location.search).get("q") || "";
+
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text) e.textContent = text; return e; }
+
+function card(r) {
+  const c = el("div", "bg-slate-900 border border-slate-800 rounded-lg p-4"); c.id = r.id;
+  const top = el("div", "flex justify-between items-center");
+  top.append(el("span", "font-semibold text-lg", "@" + r.target_username),
+             el("span", "text-xs px-2 py-1 rounded " + (COLORS[r.status] || ""), r.status));
+  c.append(top,
+    el("div", "text-sm text-slate-400", r.deal_type + " • " + new Date(r.created_at).toLocaleDateString()),
+    el("p", "mt-2", r.reason));
+  if (r.proof_urls.length) {
+    const p = el("div", "mt-3 flex flex-wrap gap-2");
+    r.proof_urls.forEach((u, i) => {
+      if (!/^https?:\/\//.test(u)) return;
+      const a = el("a", "text-sky-400 text-sm underline", "Proof " + (i + 1));
+      a.href = u; a.target = "_blank"; a.rel = "noopener noreferrer"; p.append(a);
+    });
+    c.append(p);
+  }
+  c.append(el("div", "mt-2 text-xs text-slate-600 break-all", "ID: " + r.id));
+  return c;
+}
+
+async function load() {
+  const res = await fetch("/api/reports?" + new URLSearchParams({q: q.value, status: st.value}));
+  const data = await res.json();
+  list.replaceChildren(...(data.length ? data.map(card) : [el("p", "text-slate-500", "No reports found.")]));
+  if (location.hash) document.getElementById(location.hash.slice(1))?.scrollIntoView();
+}
+let t; q.addEventListener("input", () => { clearTimeout(t); t = setTimeout(load, 300); });
+st.addEventListener("change", load);
+load();
+</script>
+</body>
+</html>
