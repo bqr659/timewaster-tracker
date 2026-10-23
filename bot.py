@@ -1,5 +1,5 @@
 """
-Timewaster Tracker v3  -  two Telegram bots in one process.
+Timewaster Tracker v3.1  -  two Telegram bots in one process.
 
 PUBLIC BOT  (BOT_TOKEN)        : file reports, /check users, track / withdraw your reports,
                                  answer admin questions, appeal a report against you.
@@ -12,8 +12,12 @@ TRACKER                        : follows users by numeric ID, detects @ swaps, u
 Required env : BOT_TOKEN, ADMIN_BOT_TOKEN, CHANNEL_ID, DATABASE_URL, ADMIN_IDS
 Optional env : CHANNEL_USERNAME, TRACK_INTERVAL_MIN (30), MAX_PENDING_PER_USER (3),
                REPORT_COOLDOWN_MIN (10), MAX_REPORTS_PER_DAY (5), REMIND_AFTER_HOURS (24), PORT
+
+v3.1 changes: automatic column migration for old databases, DB self-check at startup (admins get
+a DM if a table is broken), /dbtest admin command, passive_track can no longer crash a handler,
+version-independent "forwarded message" filter.
 """
-import os, re, io, csv, sys, html, time, asyncio, logging, threading
+import os, re, io, csv, sys, html, time, asyncio, logging, threading, traceback
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -69,6 +73,12 @@ adm: Application = None
 PUB_USERNAME = ""
 STARTED = time.time()
 STATE = {"track_at": None, "track_res": None, "remind_at": 0.0, "err_at": 0.0}
+
+class _Forwarded(filters.MessageFilter):
+    """Works on every python-telegram-bot version (filters.FORWARDED was removed in newer ones)."""
+    def filter(self, message):
+        return getattr(message, "forward_origin", None) is not None
+FORWARDED = _Forwarded()
 
 # ───────────────────────── database ─────────────────────────
 engine = create_engine(DB_URL, pool_pre_ping=True, pool_recycle=300)
@@ -135,18 +145,31 @@ class Banned(Base):
     __tablename__ = "tw_banned"
     user_id = Column(BigInteger, primary_key=True)
 
-MIGRATIONS = [("tw_reports", "approved_by", "VARCHAR(64)"),
-              ("tw_reports", "published_at", "TIMESTAMP WITH TIME ZONE")]
+MODELS = (Subject, Alias, Report, StatusLog, Note, Banned)
 
 def init_db():
-    """Create new tables and add columns that v2 databases don't have yet."""
+    """Create missing tables, then add ANY column the models expect but an older database lacks."""
     Base.metadata.create_all(engine)
     insp = inspect(engine)
     with engine.begin() as cx:
-        for table, col, ddl in MIGRATIONS:
-            if col not in {c["name"] for c in insp.get_columns(table)}:
-                cx.execute(sql_text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
-                log.info("migrated: %s.%s", table, col)
+        for table in Base.metadata.sorted_tables:
+            have = {c["name"] for c in insp.get_columns(table.name)}
+            for col in table.columns:
+                if col.name in have: continue
+                ddl = col.type.compile(dialect=engine.dialect)
+                cx.execute(sql_text(f'ALTER TABLE {table.name} ADD COLUMN "{col.name}" {ddl}'))
+                log.warning("migrated: added %s.%s (%s)", table.name, col.name, ddl)
+
+def db_selfcheck():
+    """Return a list of human-readable problems (empty list = database is fine)."""
+    bad = []
+    for model in MODELS:
+        try:
+            with Session() as s:
+                s.query(model).count()
+        except Exception as e:
+            bad.append(f"{model.__tablename__}: {str(e).strip().splitlines()[0][:220]}")
+    return bad
 
 def acquire_lock():
     """Only one copy may poll Telegram. A second copy waits here (fixes 'Conflict' errors on redeploy)."""
@@ -435,15 +458,19 @@ async def reminder_loop():
         await asyncio.sleep(1800)
 
 async def passive_track(u: Update, c):
-    """If a tracked user ever talks to the public bot, we learn their current @ for free."""
-    usr = u.effective_user
-    if not usr or usr.is_bot: return
-    with Session() as s:
-        sub = s.query(Subject).filter_by(user_id=usr.id).first()
-        if not sub: return
-        old = set_username(s, sub, usr.username) if usr.username else None
-        sub.trackable, sub.last_check = True, now(); s.commit(); sid = sub.id
-    if old: await on_username_change(sid, old, usr.username)
+    """If a tracked user ever talks to the public bot, we learn their current @ for free.
+    Wrapped so that it can never break the real handlers."""
+    try:
+        usr = u.effective_user
+        if not usr or usr.is_bot: return
+        with Session() as s:
+            sub = s.query(Subject).filter_by(user_id=usr.id).first()
+            if not sub: return
+            old = set_username(s, sub, usr.username) if usr.username else None
+            sub.trackable, sub.last_check = True, now(); s.commit(); sid = sub.id
+        if old: await on_username_change(sid, old, usr.username)
+    except Exception:
+        log.exception("passive_track")
 
 # ═════════════════════════ PUBLIC BOT ═════════════════════════
 TARGET, DEAL, REASON, PROOF, CONFIRM = range(5)
@@ -778,7 +805,7 @@ def register_public(app):
         entry_points=[CommandHandler("report", rep_start),
                       CallbackQueryHandler(rep_start, pattern=r"^pm:report$")],
         states={
-            TARGET: [MessageHandler((filters.TEXT | filters.FORWARDED) & ~filters.COMMAND, got_target)],
+            TARGET: [MessageHandler((filters.TEXT | FORWARDED) & ~filters.COMMAND, got_target)],
             DEAL: [CallbackQueryHandler(got_deal, pattern=r"^d:\d$")],
             REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_reason)],
             PROOF: [MessageHandler(filters.PHOTO, got_photo),
@@ -979,6 +1006,18 @@ async def a_cancel(u, c):
 @admin_only
 async def a_export(u, c):
     await u.effective_message.reply_document(io.BytesIO(export_csv()), filename="reports.csv")
+
+@admin_only
+async def a_dbtest(u, c):
+    """Tests every table separately and prints the exact database error, if any."""
+    lines = []
+    for model in MODELS:
+        try:
+            with Session() as s:
+                lines.append(f"OK  {model.__tablename__}: {s.query(model).count()} rows")
+        except Exception:
+            lines.append(f"ERR {model.__tablename__}:\n{traceback.format_exc()[-500:]}")
+    await u.message.reply_text("\n".join(lines)[:3900])
 
 def confirm_kb(yes, rid, label_yes):
     return Kb([[Btn(label_yes, yes), Btn("↩️ Cancel", f"r:{rid}")]])
@@ -1217,6 +1256,7 @@ def register_admin(app):
     app.add_handler(CommandHandler(["start", "menu"], a_start))
     app.add_handler(CommandHandler("cancel", a_cancel))
     app.add_handler(CommandHandler("export", a_export))
+    app.add_handler(CommandHandler("dbtest", a_dbtest))
     app.add_handler(CallbackQueryHandler(a_cb))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, a_text))
 
@@ -1253,12 +1293,18 @@ async def main():
                                    BotCommand("track", "Track a report by ID"),
                                    BotCommand("appeal", "Appeal a report about you"), BotCommand("cancel", "Cancel")])
     await adm.bot.set_my_commands([BotCommand("menu", "Admin panel"), BotCommand("export", "Export reports CSV"),
-                                   BotCommand("cancel", "Cancel action")])
+                                   BotCommand("dbtest", "Test the database"), BotCommand("cancel", "Cancel action")])
     for a in (pub, adm):
         await a.updater.start_polling(drop_pending_updates=True)
     ok, msg = await channel_check()
     (log.info if ok else log.error)("%s", msg)
     if not ok: await alert_admins("⚠️ <b>Channel problem</b>\n" + esc(msg))
+    bad = await asyncio.to_thread(db_selfcheck)
+    if bad:
+        log.error("DATABASE PROBLEMS: %s", bad)
+        await alert_admins("🔴 <b>Database problem at startup</b>\n<code>" + esc("\n".join(bad))[:3000] + "</code>")
+    else:
+        log.info("Database self-check OK.")
     log.info("Running. Public bot @%s | admins: %s", PUB_USERNAME, sorted(ADMIN_IDS))
     tasks = [asyncio.create_task(tracker_loop()), asyncio.create_task(reminder_loop())]
     try:
