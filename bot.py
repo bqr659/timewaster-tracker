@@ -1323,10 +1323,14 @@ async def on_error(u, c):
         await alert_admins(f"⚠️ <b>Bot error</b>\n<code>{esc(repr(c.error)[:300])}</code>")
 
 def health_server():
+    """Tiny web server so Render sees an open port and an uptime pinger can keep the service awake."""
     port = os.getenv("PORT")
     if not port: return
     class H(BaseHTTPRequestHandler):
-        def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+        def do_GET(self):
+            self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+        def do_HEAD(self):                                       # UptimeRobot free plan uses HEAD
+            self.send_response(200); self.end_headers()
         def log_message(self, *a): pass
     threading.Thread(target=HTTPServer(("0.0.0.0", int(port)), H).serve_forever, daemon=True).start()
 
