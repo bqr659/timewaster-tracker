@@ -1,5 +1,5 @@
 """
-Timewaster Tracker v3.4  -  two Telegram bots in one process.
+Timewaster Tracker v3.5  -  two Telegram bots in one process.
 
 PUBLIC BOT  (BOT_TOKEN)        : file reports, /status users (image card), track / withdraw your reports,
                                  answer admin questions, appeal a report against you.
@@ -18,9 +18,12 @@ Optional env : CHANNEL_USERNAME, TRACK_INTERVAL_MIN (30), MAX_PENDING_PER_USER (
 Requires     : Pillow, telethon  (add both to requirements.txt)
 Optional     : fonts/Montserrat-Bold.ttf + fonts/Montserrat-Regular.ttf next to this file (nicer card text)
 
-v3.4 changes: brand-new /status card (blurred-avatar backdrop, glow ring, status badge with icon, glass stat
-panels). Fixed "no username" for people whose @ is a collectible / extra username (Telegram now lets one
-account own several usernames; the lookup now reads all of them and shows the extras as "aka").
+v3.5 changes:
+  1. "View Full Report" (channel post + /status card) now opens the PROOF CHANNEL link directly, not the bot.
+  2. "View post" links always use the public https://t.me/<username>/<id> format (the channel's @ is
+     auto-detected at startup), so anyone can open the post and join - no more "you aren't a member".
+  3. /status card redesigned: everything is real frosted glass (blurred backdrop under translucent panels).
+v3.4 changes: new /status card, extra usernames ("aka") support.
 v3.3 changes: Telethon lookup account for name / ID / photo.
 v3.2 changes: /check is now /status and answers with a generated profile card image.
 v3.1 changes: automatic column migration, DB self-check at startup, /dbtest, safer passive_track.
@@ -34,7 +37,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from sqlalchemy import (create_engine, inspect, text as sql_text, Column, Integer, BigInteger, String,
                         Text, DateTime, JSON, Boolean, ForeignKey, func, desc)
 from sqlalchemy.orm import declarative_base, sessionmaker
-from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageEnhance, ImageChops
 from telegram import (Update, InlineKeyboardButton as _IKB, InlineKeyboardMarkup as Kb,
                       InputMediaPhoto, BotCommand, LinkPreviewOptions,
                       MessageOriginUser, MessageOriginHiddenUser)
@@ -283,11 +286,18 @@ def find_subjects(s, t):
             .filter(func.lower(Alias.username) == t.lower()).distinct().all())
 
 def post_url(r):
+    """Link to the channel post. PUBLIC format (t.me/<username>/<id>) works for everyone and lets them join.
+    The private t.me/c/... format only works for members, so it is a last resort."""
     if not r.chan_msgs: return None
     if CHANNEL_USERNAME: return f"https://t.me/{CHANNEL_USERNAME}/{r.chan_msgs[0]}"
-    if isinstance(CHANNEL, int) and str(CHANNEL).startswith("-100"):     # private channel link
+    if isinstance(CHANNEL, int) and str(CHANNEL).startswith("-100"):     # private channel link (members only)
         return f"https://t.me/c/{str(CHANNEL)[4:]}/{r.chan_msgs[0]}"
     return None
+
+def full_report_url(r):
+    """Where 'View Full Report' goes: straight to the proof channel, NOT to the bot."""
+    if r.proof_link: return r.proof_link
+    return post_url(r)
 
 def parse_identity(m):
     """text / forwarded message -> (user_id, username, name, error)"""
@@ -341,6 +351,21 @@ async def channel_check():
                            ("delete", "can_delete_messages")) if not getattr(me, a, False)]
     if miss: return False, "The public bot lacks channel permission(s): " + ", ".join(miss)
     return True, "Channel OK (public bot can post, edit and delete)."
+
+async def detect_channel_username():
+    """Read the channel's public @ from Telegram so post links are always the public (joinable) format."""
+    global CHANNEL_USERNAME
+    try:
+        ch = await pub.bot.get_chat(CHANNEL)
+    except TelegramError as e:
+        log.warning("Couldn't read channel info: %s", e); return
+    if ch.username:
+        if CHANNEL_USERNAME.lower() != ch.username.lower():
+            log.info("Channel public username detected: @%s", ch.username)
+        CHANNEL_USERNAME = ch.username
+    elif not CHANNEL_USERNAME:
+        log.warning("The channel has NO public @username - post links will be private (members only). "
+                    "Set one in channel settings -> Channel Type -> Public.")
 
 # ───────────────────────── lookup account (Telethon) ─────────────────────────
 # A normal Telegram account (use a SPARE one) that can resolve any public @username to ID + name + photo.
@@ -411,15 +436,17 @@ def render_post(s, r):
     return f"❌ {who} has been marked as a {esc(POST_WORD)}."
 
 def post_kb(s, r, profile=True):
-    """[View Profile] [View Full Report] buttons under the channel post."""
+    """[View Profile] [View Full Report] buttons under the channel post.
+    'View Full Report' opens the proof channel directly (not the bot)."""
     sub = s.get(Subject, r.subject_id)
     row = []
     if profile:
         url = (f"https://t.me/{sub.username}" if sub.username
                else f"tg://user?id={sub.user_id}" if sub.user_id else None)
         if url: row.append(_IKB("View Profile", url=url))
-    if PUB_USERNAME:
-        row.append(_IKB("View Full Report", url=f"https://t.me/{PUB_USERNAME}?start=r{r.id}"))
+    full = full_report_url(r)
+    if full:
+        row.append(_IKB("View Full Report", url=full))
     return Kb([row]) if row else None
 
 def banner_source():
@@ -581,7 +608,7 @@ CARD_STYLE = {   # status -> (badge text, accent colour, one-line note)
     "CLEAN":    ("NO REPORTS", (92, 168, 255),  "No public reports were found for this account."),
 }
 GLYPH = {"FLAGGED": "cross", "DISPUTED": "alert", "RESOLVED": "check", "CLEAN": "check"}
-BG, WHITE, MUTED, DIM = (11, 13, 19), (246, 248, 252), (150, 158, 176), (96, 104, 122)
+BG, WHITE, MUTED, DIM = (11, 13, 19), (246, 248, 252), (176, 184, 204), (130, 138, 158)
 
 def _font(bold, size):
     for p in (os.path.join(FONT_DIR, "Montserrat-Bold.ttf" if bold else "Montserrat-Regular.ttf"),
@@ -620,19 +647,44 @@ def _glyph(dr, kind, cx, cy, r, color):
         dr.ellipse((cx - w * .62, cy + r * .34 - w * .62, cx + w * .62, cy + r * .34 + w * .62), fill=color)
 
 def _backdrop(W, H, S, col, av):
-    """Dark background; if there is an avatar, a heavily blurred copy of it glows behind everything."""
+    """Colourful background for the glass to blur: blurred avatar + glowing colour blobs."""
     base = Image.new("RGB", (W * S, H * S), BG)
     if av is not None:
         small = ImageOps.fit(av, (W // 5, H // 5)).filter(ImageFilter.GaussianBlur(10))
-        glow = small.resize((W * S, H * S), Image.LANCZOS)
-        base = Image.blend(base, glow, 0.42)
-    base = Image.blend(base, Image.new("RGB", base.size, col), 0.08)
-    shade = Image.linear_gradient("L").resize(base.size)                  # black->white top to bottom
-    shade = shade.point(lambda v: int(v * 0.55))                          # darken toward the bottom
+        base = Image.blend(base, small.resize((W * S, H * S), Image.LANCZOS), 0.45)
+    blobs = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    bd = ImageDraw.Draw(blobs)
+    violet, cyan = (150, 110, 255), (60, 205, 255)
+    for cx, cy, r, c, a in ((170, 130, 270, col, 175), (860, 520, 310, violet, 150),
+                            (830, 60, 210, cyan, 110), (110, 570, 190, cyan, 85)):
+        bd.ellipse([(cx - r) * S, (cy - r) * S, (cx + r) * S, (cy + r) * S], fill=c + (a,))
+    blobs = blobs.filter(ImageFilter.GaussianBlur(70 * S))
+    base = Image.alpha_composite(base.convert("RGBA"), blobs).convert("RGB")
+    shade = Image.linear_gradient("L").resize(base.size).point(lambda v: int(v * 0.35))
     return Image.composite(Image.new("RGB", base.size, BG), base, shade)
 
+def _glass(img, box, r, S, a=34, tint=(255, 255, 255), border=(255, 255, 255, 95), blur=14, sheen=0.20):
+    """Draw a frosted-glass panel IN PLACE on an RGBA image: blur what is underneath, add a translucent
+    tint, a soft top highlight and a light border. Panels drawn later blur the panels drawn before."""
+    x0, y0, x1, y1 = [int(v * S) for v in box]
+    w, h = x1 - x0, y1 - y0
+    reg = img.crop((x0, y0, x1, y1)).filter(ImageFilter.GaussianBlur(blur * S))
+    reg = ImageEnhance.Brightness(reg).enhance(1.10)
+    m = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(m).rounded_rectangle((0, 0, w - 1, h - 1), int(r * S), fill=255)
+    img.paste(reg, (x0, y0), m)
+    layer = Image.new("RGBA", (w, h), tint + (a,))
+    top = ImageOps.flip(Image.linear_gradient("L").resize((w, h))).point(lambda v: int(v * sheen))
+    shine = Image.new("RGBA", (w, h), (255, 255, 255, 0)); shine.putalpha(top)
+    layer = Image.alpha_composite(layer, shine)
+    layer.putalpha(ImageChops.multiply(layer.getchannel("A"), m))
+    img.alpha_composite(layer, (x0, y0))
+    ImageDraw.Draw(img, "RGBA").rounded_rectangle((x0, y0, x1 - 1, y1 - 1), int(r * S),
+                                                  outline=border, width=max(1, S))
+
 def render_card(d, avatar=None):
-    """Status card. d = dict(username, alts, name, uid, status, reports, verified, last, bot). Returns PNG bytes."""
+    """Status card, all glass. d = dict(username, alts, name, uid, status, reports, verified, last, bot).
+    Returns PNG bytes."""
     W, H, S = 1000, 600, 2                                    # drawn at 2x, shrunk at the end for smooth edges
     px = lambda v: int(v * S)
     lab, col, note = CARD_STYLE[d["status"]]
@@ -648,43 +700,44 @@ def render_card(d, avatar=None):
     meas = ImageDraw.Draw(base)
     tw = lambda text, font: meas.textlength(text, font=font) / S          # width in card units
 
-    # glow behind the avatar
+    # coloured glow behind the avatar (gives the glass something bright to blur)
     D, ax, ay = 220, 70, 110
     glow = Image.new("RGBA", base.size, (0, 0, 0, 0))
     ImageDraw.Draw(glow).ellipse([px(ax - 8), px(ay - 8), px(ax + D + 8), px(ay + D + 8)], fill=col + (150,))
-    base = Image.alpha_composite(base, glow.filter(ImageFilter.GaussianBlur(px(26))))
-
-    # frosted-glass layer (drawn first so the text lands on top)
-    ov = Image.new("RGBA", base.size, (0, 0, 0, 0)); od = ImageDraw.Draw(ov)
-    def glass(box, r, a=24, outline=(255, 255, 255, 48), fill=None):
-        od.rounded_rectangle([px(v) for v in box], px(r), fill=fill or (255, 255, 255, a), outline=outline, width=S)
+    img = Image.alpha_composite(base, glow.filter(ImageFilter.GaussianBlur(px(26))))
 
     X = 340                                                    # right column start
     f_id = F(False, 21)
     id_txt = f"ID  {d['uid']}" if d.get("uid") else "ID  unknown"
     id_w = tw(id_txt, f_id) + 40
-    glass((X, 226, X + id_w, 268), 21)
-
     f_pill = F(True, 25)
     pill_w = 62 + tw(lab, f_pill) + 30
-    glass((X, 296, X + pill_w, 350), 27, fill=col + (46,), outline=col + (210,))
-
-    od.line([px(70), px(84), px(W - 70), px(84)], fill=(255, 255, 255, 34), width=S)   # header rule
+    f_h, f_b = F(True, 17), F(False, 19)
+    head_txt, bot_txt = "ACCOUNT CHECK", f"@{d['bot']}"
+    head_w = sum(tw(ch, f_h) + 3 for ch in head_txt) - 3
+    bot_w = tw(bot_txt, f_b)
     pw = (W - 140 - 40) / 3
-    for i in range(3):
-        x0 = 70 + i * (pw + 20)
-        glass((x0, 420, x0 + pw, 540), 22)
 
-    img = Image.alpha_composite(base, ov)
-    dr = ImageDraw.Draw(img)
+    # ---- ALL glass first (so nothing blurs text) ----
+    _glass(img, (24, 20, W - 24, H - 20), 40, S, a=26, blur=22, sheen=0.16)              # main card
+    _glass(img, (56, 28, 96 + head_w + 18, 68), 20, S, a=30, blur=8)                      # header chip
+    _glass(img, (W - 70 - bot_w - 18, 28, W - 52, 68), 20, S, a=30, blur=8)               # bot chip
+    _glass(img, (ax - 16, ay - 16, ax + D + 16, ay + D + 16), (D + 32) / 2, S, a=30, blur=10)  # avatar ring
+    _glass(img, (X, 226, X + id_w, 268), 21, S, a=30, blur=8)                             # ID chip
+    _glass(img, (X, 296, X + pill_w, 350), 27, S, a=70, tint=col, border=col + (230,), blur=8)  # status pill
+    for i in range(3):                                                                    # stat panels
+        x0 = 70 + i * (pw + 20)
+        _glass(img, (x0, 420, x0 + pw, 540), 24, S, a=32, blur=12)
+
+    dr = ImageDraw.Draw(img, "RGBA")
+    dr.line([px(70), px(88), px(W - 70), px(88)], fill=(255, 255, 255, 34), width=S)      # header rule
 
     # header
     dr.ellipse((px(70), px(42), px(82), px(54)), fill=col)
-    _spaced(dr, px(96), px(48), "ACCOUNT CHECK", F(True, 17), MUTED, px(3))
-    dr.text((px(W - 70), px(48)), f"@{d['bot']}", font=F(False, 19), fill=MUTED, anchor="rm")
+    _spaced(dr, px(96), px(48), head_txt, f_h, WHITE, px(3))
+    dr.text((px(W - 70), px(48)), bot_txt, font=f_b, fill=WHITE, anchor="rm")
 
-    # avatar with ring
-    pic = None
+    # avatar (sits inside the glass ring)
     if av is not None:
         pic = ImageOps.fit(av, (px(D), px(D)))
     else:
@@ -692,9 +745,8 @@ def render_card(d, avatar=None):
         ImageDraw.Draw(pic).text((px(D) // 2, px(D) // 2), (d["name"] or d["username"] or "?")[0].upper(),
                                  font=F(True, 100), fill=WHITE, anchor="mm")
     m = Image.new("L", (px(D), px(D)), 0); ImageDraw.Draw(m).ellipse((0, 0, px(D) - 1, px(D) - 1), fill=255)
-    dr.ellipse((px(ax - 7), px(ay - 7), px(ax + D + 7), px(ay + D + 7)), fill=col)
-    dr.ellipse((px(ax - 3), px(ay - 3), px(ax + D + 3), px(ay + D + 3)), fill=(14, 16, 22))
     img.paste(pic, (px(ax), px(ay)), m)
+    dr.ellipse((px(ax - 3), px(ay - 3), px(ax + D + 3), px(ay + D + 3)), outline=col, width=px(3))
 
     # name / @username / ID
     f_name = F(True, 54)
@@ -711,13 +763,13 @@ def render_card(d, avatar=None):
             dr.text((px(x_extra), px(206)), _fit(dr, extra, f_x, px(W - 60 - x_extra)), font=f_x, fill=MUTED, anchor="lm")
     else:
         dr.text((px(X), px(204)), "no username", font=F(False, 27), fill=MUTED, anchor="lm")
-    dr.text((px(X + 20), px(247)), id_txt, font=f_id, fill=MUTED, anchor="lm")
+    dr.text((px(X + 20), px(247)), id_txt, font=f_id, fill=WHITE, anchor="lm")
 
     # status pill + note
     cx, cy, cr = X + 29, 323, 19
     dr.ellipse((px(cx - cr), px(cy - cr), px(cx + cr), px(cy + cr)), fill=col)
     _glyph(dr, kind, px(cx), px(cy), px(cr), (14, 16, 22))
-    dr.text((px(X + 58), px(323)), lab, font=f_pill, fill=col, anchor="lm")
+    dr.text((px(X + 58), px(323)), lab, font=f_pill, fill=WHITE, anchor="lm")
     f_n = F(False, 21)
     dr.text((px(X), px(378)), _fit(dr, note, f_n, px(W - X - 60)), font=f_n, fill=MUTED, anchor="lm")
 
@@ -730,7 +782,7 @@ def render_card(d, avatar=None):
         dr.text((px(cxm), px(470)), v, font=F(True, size), fill=col if hot else WHITE, anchor="mm")
         _spaced(dr, px(cxm), px(515), k, F(True, 15), MUTED, px(3), anchor="m")
 
-    _spaced(dr, px(W / 2), px(574), "POWERED BY @SOWCO", F(True, 13), DIM, px(2.5), anchor="m")
+    _spaced(dr, px(W / 2), px(562), "POWERED BY @SOWCO", F(True, 13), DIM, px(2.5), anchor="m")
 
     mask = Image.new("L", img.size, 0)
     ImageDraw.Draw(mask).rounded_rectangle((0, 0, px(W) - 1, px(H) - 1), px(34), fill=255)
@@ -764,7 +816,8 @@ def status_data(t):
                             reports=len(reps), verified=sum(r.status == "VERIFIED" for r in reps),
                             bot=PUB_USERNAME, rid=last.id if last else None,
                             last=f"{last.created_at:%d %b %Y}" if last else None,
-                            proof=(post_url(last) or last.proof_link) if last else None,
+                            post=post_url(last) if last else None,                 # the channel post
+                            proof=full_report_url(last) if last else None,         # the proof channel
                             aliases=aliases_of(s, sub)))
     return out
 
@@ -777,7 +830,8 @@ async def send_status(u, t):
         rows = [dict(uid=info["uid"] if info else (int(t) if t.isdigit() else None),
                      username=info["username"] if info else (None if t.isdigit() else t),
                      name=info["name"] if info else None, aliases=[],
-                     status="CLEAN", reports=0, verified=0, bot=PUB_USERNAME, rid=None, last=None, proof=None)]
+                     status="CLEAN", reports=0, verified=0, bot=PUB_USERNAME, rid=None, last=None,
+                     post=None, proof=None)]
     private = u.effective_chat.type == ChatType.PRIVATE               # buttons only in the bot's own chat
     for d in rows:
         photo, extra = None, []
@@ -798,9 +852,10 @@ async def send_status(u, t):
                 else f"tg://user?id={d['uid']}" if d["uid"] else None)
         kb = []
         top = ([_IKB("View Profile", url=prof)] if prof else []) + \
-              ([_IKB("View Proof", url=d["proof"])] if d["proof"] else [])
+              ([_IKB("View Post", url=d["post"])] if d["post"] else [])
         if top: kb.append(top)
-        if d["rid"]: kb.append([_IKB("View Full Report", url=f"https://t.me/{PUB_USERNAME}?start=r{d['rid']}")])
+        if d["proof"]:                                                # straight to the proof channel
+            kb.append([_IKB("View Full Report", url=d["proof"])])
         kb.append([Btn("Report User", "pm:report")])
         try:
             await u.effective_message.reply_photo(io.BytesIO(png), reply_markup=Kb(kb))
@@ -821,7 +876,7 @@ async def say(u, text, kb=None):
 async def p_start(u, c):
     c.user_data.pop("await", None)
     arg = c.args[0] if c.args else ""
-    if len(arg) > 1 and arg[0] == "r" and arg[1:].isdigit():        # "View Full Report" from a channel post
+    if len(arg) > 1 and arg[0] == "r" and arg[1:].isdigit():        # old "View Full Report" deep links still work
         with Session() as s:
             r = s.get(Report, int(arg[1:]))
             if r and r.status in PUBLISHED:
@@ -988,7 +1043,7 @@ async def p_cancel_any(u, c):                         # /cancel outside the repo
     await say(u, "Cancelled.", pub_home_kb())
 
 def report_card(s, r):
-    """What 'View Full Report' shows: every detail of one published report."""
+    """What the old 'View Full Report' deep link shows: every detail of one published report."""
     sub = s.get(Subject, r.subject_id)
     al = aliases_of(s, sub)
     n = s.query(Report).filter(Report.subject_id == sub.id, Report.status.in_(PUBLISHED)).count()
@@ -1350,7 +1405,9 @@ async def diagnostics():
     tr = STATE["track_res"]
     up = int(time.time() - STARTED)
     lk = "🟢 Lookup account: ready" if LOOKUP["client"] else "🔴 Lookup account: NOT connected (set TG_API_ID / TG_API_HASH / TG_SESSION)"
-    return ("🩺 <b>Diagnostics</b>\n\n" + ("🟢 " if ok else "🔴 ") + esc(msg) + "\n" + lk +
+    links = (f"🟢 Post links: public (t.me/{esc(CHANNEL_USERNAME)}/…)" if CHANNEL_USERNAME else
+             "🔴 Post links: PRIVATE (members only) - give the channel a public @username")
+    return ("🩺 <b>Diagnostics</b>\n\n" + ("🟢 " if ok else "🔴 ") + esc(msg) + "\n" + links + "\n" + lk +
             f"\n🤖 Public bot: @{esc(PUB_USERNAME)}\n👮 Admins: {len(ADMIN_IDS)}\n📥 Pending: {pend}\n"
             f"📡 Tracker: " + (f"last run {STATE['track_at']:%H:%M} UTC - {tr[0]}/{tr[2]} reachable"
                                if tr else "hasn't run yet") +
@@ -1658,6 +1715,7 @@ async def main():
     for a in (pub, adm):
         await a.initialize(); await a.start()
     PUB_USERNAME = pub.bot.username
+    await detect_channel_username()                              # makes every post link public + joinable
     await start_lookup()                                         # Telethon lookup account (ID / name / photo)
     await pub.bot.set_my_commands([BotCommand("start", "Menu"), BotCommand("report", "File a report"),
                                    BotCommand("status", "Look up a user"), BotCommand("my", "My reports"),
