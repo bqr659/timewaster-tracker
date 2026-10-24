@@ -507,13 +507,13 @@ async def passive_track(u: Update, c):
 
 # ───────────────────────── /status profile card (image) ─────────────────────────
 FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
-GOLD, GOLD_L, MUTED = (226, 170, 80), (250, 222, 150), (170, 150, 120)
-CARD_STYLE = {   # status -> (pill text, colour, note under the name)
-    "FLAGGED":  ("FLAGGED",    (230, 70, 70),  "This account has verified timewaster reports. Be careful when dealing."),
-    "DISPUTED": ("DISPUTED",   (235, 150, 50), "Reports exist, but the case is currently disputed."),
-    "RESOLVED": ("RESOLVED",   (80, 200, 120), "This account was previously flagged but the case has been resolved."),
-    "CLEAN":    ("NO REPORTS", (226, 170, 80), "No public reports were found for this account."),
+CARD_STYLE = {   # status -> (badge text, accent colour, one-line note)
+    "FLAGGED":  ("FLAGGED",    (239, 83, 80),   "Verified timewaster reports exist. Deal with caution."),
+    "DISPUTED": ("DISPUTED",   (255, 167, 38),  "Reports exist, but the case is currently disputed."),
+    "RESOLVED": ("RESOLVED",   (102, 187, 106), "Previously reported, but the case has been resolved."),
+    "CLEAN":    ("NO REPORTS", (100, 181, 246), "No public reports were found for this account."),
 }
+BG, PANEL, WHITE, MUTED, LINE = (15, 17, 23), (24, 27, 36), (245, 247, 250), (140, 148, 163), (44, 48, 60)
 
 def _font(bold, size):
     for p in (os.path.join(FONT_DIR, "Montserrat-Bold.ttf" if bold else "Montserrat-Regular.ttf"),
@@ -522,62 +522,72 @@ def _font(bold, size):
         except OSError: continue
     return ImageFont.load_default(size)
 
-def _grad(size, c1, c2):
-    m = Image.linear_gradient("L").resize(size)
-    return Image.composite(Image.new("RGB", size, c2), Image.new("RGB", size, c1), m)
+def _mix(a, b, t):
+    return tuple(int(a[i] * t + b[i] * (1 - t)) for i in range(3))
+
+def _fit(dr, text, font, maxw):
+    while len(text) > 1 and dr.textlength(text, font=font) > maxw:
+        text = text[:-2].rstrip() + "…"
+    return text
 
 def render_card(d, avatar=None):
-    """d = dict(username, name, status, reports, verified, bot). Returns PNG bytes."""
-    W, H = 1000, 560
-    img = _grad((W, H), (12, 10, 8), (44, 32, 16))
+    """Clean status card. d = dict(username, name, uid, status, reports, verified, last, bot). Returns PNG bytes."""
+    W, H = 1000, 460
+    S = 2                                                     # draw at 2x, shrink for smooth edges
+    img = Image.new("RGB", (W * S, H * S), BG)
     dr = ImageDraw.Draw(img)
-    dr.rounded_rectangle((8, 8, W - 8, H - 8), 28, outline=(120, 90, 40), width=3)
     lab, col, note = CARD_STYLE[d["status"]]
+    def F(bold, size): return _font(bold, size * S)
+    def R(box, r, **k): dr.rounded_rectangle([v * S for v in box], r * S, **k)
 
-    # avatar (circle with gold ring)
-    D, ax, ay = 200, 60, 60
+    R((0, 0, W - 1, H - 1), 30, fill=PANEL)                   # card
+    dr.rectangle((0, 0, W * S, 10 * S), fill=col)             # accent bar, clipped by the corners below
+    mask = Image.new("L", img.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, W * S - 1, H * S - 1), 30 * S, fill=255)
+    bg = Image.new("RGB", img.size, BG); bg.paste(img, (0, 0), mask); img = bg; dr = ImageDraw.Draw(img)
+
+    # avatar
+    D, ax, ay = 190, 60, 70
     pic = None
     if avatar:
-        try:
-            pic = ImageOps.fit(Image.open(io.BytesIO(avatar)).convert("RGB"), (D, D))
-        except Exception:
-            pic = None
+        try: pic = ImageOps.fit(Image.open(io.BytesIO(avatar)).convert("RGB"), (D * S, D * S))
+        except Exception: pic = None
     if pic is None:
-        pic = _grad((D, D), GOLD_L, (150, 100, 40))
-        ImageDraw.Draw(pic).text((D // 2, D // 2), (d["name"] or d["username"] or "?")[0].upper(),
-                                 font=_font(True, 90), fill=(60, 40, 10), anchor="mm")
-    mask = Image.new("L", (D, D), 0); ImageDraw.Draw(mask).ellipse((0, 0, D, D), fill=255)
-    dr.ellipse((ax - 6, ay - 6, ax + D + 6, ay + D + 6), fill=GOLD)
-    img.paste(pic, (ax, ay), mask)
+        pic = Image.new("RGB", (D * S, D * S), _mix(col, PANEL, 0.35))
+        ImageDraw.Draw(pic).text((D * S // 2, D * S // 2), (d["name"] or d["username"] or "?")[0].upper(),
+                                 font=F(True, 90), fill=col, anchor="mm")
+    m = Image.new("L", (D * S, D * S), 0); ImageDraw.Draw(m).ellipse((0, 0, D * S - 1, D * S - 1), fill=255)
+    dr.ellipse(((ax - 7) * S, (ay - 7) * S, (ax + D + 7) * S, (ay + D + 7) * S), fill=col)
+    dr.ellipse(((ax - 3) * S, (ay - 3) * S, (ax + D + 3) * S, (ay + D + 3) * S), fill=PANEL)
+    img.paste(pic, (ax * S, ay * S), m)
 
-    # texts
+    # name / @username / id
     x = 300
-    dr.text((x, 62), "USERNAME", font=_font(True, 18), fill=GOLD)
-    uname = f"@{d['username']}" if d["username"] else "no username"
-    dr.text((x, 88), uname[:22], font=_font(True, 54), fill=(255, 255, 255))
-    dr.text((x, 168), "DISPLAY NAME", font=_font(True, 18), fill=GOLD)
-    dr.text((x, 192), (d["name"] or "-")[:26], font=_font(True, 44), fill=GOLD_L)
+    dr.text((x * S, 68 * S), _fit(dr, d["name"] or "Unknown", F(True, 46), 640 * S), font=F(True, 46), fill=WHITE)
+    sub = f"@{d['username']}" if d["username"] else "no username"
+    if d.get("uid"): sub += f"   ·   ID {d['uid']}"
+    dr.text((x * S, 128 * S), _fit(dr, sub, F(False, 24), 640 * S), font=F(False, 24), fill=MUTED)
 
-    # status pill (top right)
-    dr.rounded_rectangle((740, 36, 960, 88), 26, fill=(40, 30, 14), outline=col, width=3)
-    dr.text((850, 62), lab, font=_font(True, 24), fill=col, anchor="mm")
+    # status badge + note
+    bf = F(True, 22)
+    tw = dr.textlength(lab, font=bf) / S
+    R((x, 180, x + tw + 62, 222), 21, fill=_mix(col, PANEL, 0.18), outline=col, width=2 * S)
+    dr.ellipse(((x + 18) * S, 195 * S, (x + 30) * S, 207 * S), fill=col)
+    dr.text(((x + 42) * S, 201 * S), lab, font=bf, fill=col, anchor="lm")
+    dr.text((x * S, 244 * S), _fit(dr, note, F(False, 22), 640 * S), font=F(False, 22), fill=MUTED)
 
-    # note box
-    dr.rounded_rectangle((x, 262, 950, 322), 30, fill=(24, 18, 10), outline=(90, 68, 30), width=2)
-    for i, line in enumerate(textwrap.wrap(note, 62)[:2]):
-        dr.text((x + 24, 276 + i * 22), line, font=_font(False, 18), fill=(215, 195, 160))
+    # stats row
+    dr.line((60 * S, 320 * S, (W - 60) * S, 320 * S), fill=LINE, width=2 * S)
+    cols = [(str(d["reports"]), "REPORTS"), (str(d["verified"]), "VERIFIED"), (d.get("last") or "—", "LAST REPORT")]
+    cw = (W - 120) / 3
+    for i, (v, k) in enumerate(cols):
+        cx = int(60 + cw * i + cw / 2)
+        dr.text((cx * S, 360 * S), v, font=F(True, 44 if len(v) < 8 else 34), fill=WHITE, anchor="mm")
+        dr.text((cx * S, 398 * S), k, font=F(True, 17), fill=MUTED, anchor="mm")
+        if i: dr.line((int(60 + cw * i) * S, 338 * S, int(60 + cw * i) * S, 410 * S), fill=LINE, width=2 * S)
 
-    # stat boxes
-    stats = [("Reports", str(d["reports"]), (255, 255, 255)),
-             ("Verified", str(d["verified"]), (255, 255, 255)),
-             ("Status", d["status"].title() if d["status"] != "CLEAN" else "Clean", col)]
-    for i, (k, v, vc) in enumerate(stats):
-        bx = 55 + i * 310
-        dr.rounded_rectangle((bx, 350, bx + 270, 495), 26, fill=(26, 20, 12), outline=(110, 82, 36), width=2)
-        dr.text((bx + 135, 385), k, font=_font(True, 24), fill=MUTED, anchor="mm")
-        dr.text((bx + 135, 442), v, font=_font(True, 54 if len(v) < 6 else 40), fill=vc, anchor="mm")
-
-    dr.text((W // 2, 525), f"Powered by @{d['bot']}", font=_font(False, 18), fill=MUTED, anchor="mm")
+    dr.text(((W // 2) * S, 436 * S), f"Powered by @{d['bot']}", font=F(False, 16), fill=(95, 102, 118), anchor="mm")
+    img = img.resize((W, H), Image.LANCZOS)
     out = io.BytesIO(); img.save(out, "PNG"); return out.getvalue()
 
 async def avatar_bytes(uid):
@@ -604,6 +614,7 @@ def status_data(t):
             out.append(dict(uid=sub.user_id, username=sub.username, name=sub.first_name, status=st,
                             reports=len(reps), verified=sum(r.status == "VERIFIED" for r in reps),
                             bot=PUB_USERNAME, rid=last.id if last else None,
+                            last=f"{last.created_at:%d %b %Y}" if last else None,
                             proof=(post_url(last) or last.proof_link) if last else None))
     return out
 
@@ -612,9 +623,12 @@ async def send_status(u, t):
     if not rows:                                     # unknown account -> clean card
         t = t.strip().lstrip("@")
         rows = [dict(uid=int(t) if t.isdigit() else None, username=None if t.isdigit() else t, name=None,
-                     status="CLEAN", reports=0, verified=0, bot=PUB_USERNAME, rid=None, proof=None)]
+                     status="CLEAN", reports=0, verified=0, bot=PUB_USERNAME, rid=None, last=None, proof=None)]
+    private = u.effective_chat.type == ChatType.PRIVATE      # buttons only in the bot's own chat
     for d in rows:
         png = await asyncio.to_thread(render_card, d, await avatar_bytes(d["uid"]))
+        if not private:                                       # groups / supergroups: image only, no buttons
+            await u.effective_message.reply_photo(io.BytesIO(png)); continue
         prof = (f"https://t.me/{d['username']}" if d["username"]
                 else f"tg://user?id={d['uid']}" if d["uid"] else None)
         kb = []
@@ -843,6 +857,8 @@ async def p_check(u, c):                              # /status (and the old /ch
         await say(u, "Too many lookups - try again in a bit."); return
     if c.args:
         await send_status(u, c.args[0]); return
+    if u.effective_chat.type != ChatType.PRIVATE:             # in groups the target must be in the command
+        await say(u, "Usage: /status @username  (or a numeric ID)"); return
     c.user_data["await"] = ("check", None)
     await say(u, "Send the @username or ID to look up.")
 
