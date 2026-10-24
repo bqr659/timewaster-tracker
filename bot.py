@@ -16,6 +16,7 @@ Optional env : CHANNEL_USERNAME, TRACK_INTERVAL_MIN (30), MAX_PENDING_PER_USER (
 v3.1 changes: automatic column migration for old databases, DB self-check at startup (admins get
 a DM if a table is broken), /dbtest admin command, passive_track can no longer crash a handler,
 version-independent "forwarded message" filter.
+Proof is now a Telegram channel link only (no screenshots in the report wizard).
 """
 import os, re, io, csv, sys, html, time, asyncio, logging, threading, traceback
 from datetime import datetime, timedelta, timezone
@@ -536,7 +537,7 @@ async def p_start(u, c):
 
 async def p_help(u, c):
     if u.callback_query: await u.callback_query.answer()
-    await say(u, "<b>How it works</b>\n1. File a report with proof (screenshots and/or a proof-channel link).\n"
+    await say(u, "<b>How it works</b>\n1. File a report with proof (a link to a Telegram channel containing your proof).\n"
                  "2. An admin reviews it. If approved it's posted on the channel with your proof.\n"
                  "3. You get a message whenever the status changes, and admins may ask you for more info.\n\n"
                  "<b>Commands</b>\n/report · /check · /my · /track &lt;id&gt; · /appeal &lt;id&gt; "
@@ -600,45 +601,35 @@ async def got_reason(u, c):
     if len(t) < 15:
         await say(u, "Please add a bit more detail (at least 15 characters)."); return REASON
     c.user_data["rep"]["reason"] = t[:1200]
-    await say(u, f"<b>Step 4/4 · Proof</b>\nSend your screenshots here (up to {MAX_PHOTOS}) and/or a link to a "
-                 "Telegram channel with your proof. <b>At least one is required.</b> Press <b>Done</b> when finished.",
-              Kb([[Btn("✅ Done", "pf:done")]]))
+    await say(u, "<b>Step 4/4 · Proof</b>\nPlease create a Telegram channel and send all your proof to that channel.\n"
+                 "Once that's done, simply send me the channel URL.",
+              Kb([[Btn("✖️ Cancel", "cancel")]]))
     return PROOF
 
 async def got_photo(u, c):
-    rep = c.user_data["rep"]
-    if len(rep["photos"]) >= MAX_PHOTOS:
-        await say(u, f"Max {MAX_PHOTOS} photos reached."); return PROOF
-    rep["photos"].append(u.message.photo[-1].file_id)
-    txt, kb = f"📸 {len(rep['photos'])}/{MAX_PHOTOS} saved.", Kb([[Btn("✅ Done", "pf:done")]])
-    if rep.get("pmsg"):                               # keep one counter message instead of spamming
-        try:
-            await c.bot.edit_message_text(txt, chat_id=u.effective_chat.id, message_id=rep["pmsg"], reply_markup=kb)
-            return PROOF
-        except TelegramError: pass
-    rep["pmsg"] = (await say(u, txt, kb)).message_id
+    await say(u, "Please don't send photos here. Put your proof in a Telegram channel and send me the channel URL "
+                 "(for example https://t.me/yourchannel).")
     return PROOF
 
 async def got_link(u, c):
     t = (u.message.text or "").strip()
     if t.lower().startswith(("t.me/", "telegram.me/")): t = "https://" + t
-    if not t.lower().startswith("https://") or " " in t or len(t) > 300:
-        await say(u, "Send a valid link like https://t.me/yourchannel, or photos."); return PROOF
+    if not t.lower().startswith(("https://t.me/", "https://telegram.me/")) or " " in t or len(t) > 300:
+        await say(u, "Send a valid channel link like https://t.me/yourchannel"); return PROOF
     c.user_data["rep"]["link"] = t
-    await say(u, "🔗 Link saved.", Kb([[Btn("✅ Done", "pf:done")]]))
-    return PROOF
+    return await proof_done(u, c)
 
 async def proof_done(u, c):
     if u.callback_query: await u.callback_query.answer()
     r = c.user_data.get("rep")
     if not r: return ConversationHandler.END
-    if not r["photos"] and not r.get("link"):
-        await say(u, "⚠️ Please add at least one screenshot or a proof link first."); return PROOF
+    if not r.get("link"):
+        await say(u, "⚠️ Please send your proof channel link first."); return PROOF
     who = f"@{r['uname']}" if r.get("uname") else f"ID {r['uid']}"
     await say(u, f"<b>Please confirm</b>\n\n👤 {esc(who)}" +
                  (f" (ID <code>{r['uid']}</code>)" if r.get("uid") and r.get("uname") else "") +
-                 f"\n🏷 {esc(r['deal'])}\n📝 {esc(r['reason'])}\n📸 {len(r['photos'])} photo(s)"
-                 f"\n🔗 {esc(r.get('link') or 'no link')}\n\nSubmit this report?",
+                 f"\n🏷 {esc(r['deal'])}\n📝 {esc(r['reason'])}"
+                 f"\n🔗 {esc(r['link'])}\n\nSubmit this report?",
               Kb([[Btn("✅ Submit", "c:yes"), Btn("✖️ Cancel", "c:no")]]))
     return CONFIRM
 
@@ -863,9 +854,7 @@ def register_public(app):
             DEAL: [CallbackQueryHandler(got_deal, pattern=r"^d:\d$")],
             REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_reason)],
             PROOF: [MessageHandler(filters.PHOTO, got_photo),
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, got_link),
-                    CallbackQueryHandler(proof_done, pattern=r"^pf:done$"),
-                    CommandHandler("done", proof_done)],
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, got_link)],
             CONFIRM: [CallbackQueryHandler(submit, pattern=r"^c:yes$")],
         },
         fallbacks=[CommandHandler("cancel", cancel),
