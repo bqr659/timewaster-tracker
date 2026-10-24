@@ -1,7 +1,7 @@
 """
-Timewaster Tracker v3.1  -  two Telegram bots in one process.
+Timewaster Tracker v3.2  -  two Telegram bots in one process.
 
-PUBLIC BOT  (BOT_TOKEN)        : file reports, /check users, track / withdraw your reports,
+PUBLIC BOT  (BOT_TOKEN)        : file reports, /status users (image card), track / withdraw your reports,
                                  answer admin questions, appeal a report against you.
 ADMIN BOT   (ADMIN_BOT_TOKEN)  : button panel -> approve / reject / ask reporter / notes /
                                  edit @ / change status / retract / ban / export / diagnostics.
@@ -12,13 +12,18 @@ TRACKER                        : follows users by numeric ID, detects @ swaps, u
 Required env : BOT_TOKEN, ADMIN_BOT_TOKEN, CHANNEL_ID, DATABASE_URL, ADMIN_IDS
 Optional env : CHANNEL_USERNAME, TRACK_INTERVAL_MIN (30), MAX_PENDING_PER_USER (3),
                REPORT_COOLDOWN_MIN (10), MAX_REPORTS_PER_DAY (5), REMIND_AFTER_HOURS (24), PORT
+Requires     : Pillow  (add "Pillow" to requirements.txt)
+Optional     : fonts/Montserrat-Bold.ttf + fonts/Montserrat-Regular.ttf next to this file (nicer card text)
 
+v3.2 changes: /check is now /status and answers with a generated profile card image
+(avatar, @username, display name, status pill, Reports / Verified / Status boxes, buttons).
+/check still works as an alias.
 v3.1 changes: automatic column migration for old databases, DB self-check at startup (admins get
 a DM if a table is broken), /dbtest admin command, passive_track can no longer crash a handler,
 version-independent "forwarded message" filter.
-Proof is now a Telegram channel link only (no screenshots in the report wizard).
+Proof is a Telegram channel link only (no screenshots in the report wizard).
 """
-import os, re, io, csv, sys, html, time, asyncio, logging, threading, traceback
+import os, re, io, csv, sys, html, time, asyncio, logging, threading, traceback, textwrap
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -26,6 +31,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from sqlalchemy import (create_engine, inspect, text as sql_text, Column, Integer, BigInteger, String,
                         Text, DateTime, JSON, Boolean, ForeignKey, func, desc)
 from sqlalchemy.orm import declarative_base, sessionmaker
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from telegram import (Update, InlineKeyboardButton as _IKB, InlineKeyboardMarkup as Kb,
                       InputMediaPhoto, BotCommand, LinkPreviewOptions,
                       MessageOriginUser, MessageOriginHiddenUser)
@@ -499,6 +505,129 @@ async def passive_track(u: Update, c):
     except Exception:
         log.exception("passive_track")
 
+# ───────────────────────── /status profile card (image) ─────────────────────────
+FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+GOLD, GOLD_L, MUTED = (226, 170, 80), (250, 222, 150), (170, 150, 120)
+CARD_STYLE = {   # status -> (pill text, colour, note under the name)
+    "FLAGGED":  ("FLAGGED",    (230, 70, 70),  "This account has verified timewaster reports. Be careful when dealing."),
+    "DISPUTED": ("DISPUTED",   (235, 150, 50), "Reports exist, but the case is currently disputed."),
+    "RESOLVED": ("RESOLVED",   (80, 200, 120), "This account was previously flagged but the case has been resolved."),
+    "CLEAN":    ("NO REPORTS", (226, 170, 80), "No public reports were found for this account."),
+}
+
+def _font(bold, size):
+    for p in (os.path.join(FONT_DIR, "Montserrat-Bold.ttf" if bold else "Montserrat-Regular.ttf"),
+              "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"):
+        try: return ImageFont.truetype(p, size)
+        except OSError: continue
+    return ImageFont.load_default(size)
+
+def _grad(size, c1, c2):
+    m = Image.linear_gradient("L").resize(size)
+    return Image.composite(Image.new("RGB", size, c2), Image.new("RGB", size, c1), m)
+
+def render_card(d, avatar=None):
+    """d = dict(username, name, status, reports, verified, bot). Returns PNG bytes."""
+    W, H = 1000, 560
+    img = _grad((W, H), (12, 10, 8), (44, 32, 16))
+    dr = ImageDraw.Draw(img)
+    dr.rounded_rectangle((8, 8, W - 8, H - 8), 28, outline=(120, 90, 40), width=3)
+    lab, col, note = CARD_STYLE[d["status"]]
+
+    # avatar (circle with gold ring)
+    D, ax, ay = 200, 60, 60
+    pic = None
+    if avatar:
+        try:
+            pic = ImageOps.fit(Image.open(io.BytesIO(avatar)).convert("RGB"), (D, D))
+        except Exception:
+            pic = None
+    if pic is None:
+        pic = _grad((D, D), GOLD_L, (150, 100, 40))
+        ImageDraw.Draw(pic).text((D // 2, D // 2), (d["name"] or d["username"] or "?")[0].upper(),
+                                 font=_font(True, 90), fill=(60, 40, 10), anchor="mm")
+    mask = Image.new("L", (D, D), 0); ImageDraw.Draw(mask).ellipse((0, 0, D, D), fill=255)
+    dr.ellipse((ax - 6, ay - 6, ax + D + 6, ay + D + 6), fill=GOLD)
+    img.paste(pic, (ax, ay), mask)
+
+    # texts
+    x = 300
+    dr.text((x, 62), "USERNAME", font=_font(True, 18), fill=GOLD)
+    uname = f"@{d['username']}" if d["username"] else "no username"
+    dr.text((x, 88), uname[:22], font=_font(True, 54), fill=(255, 255, 255))
+    dr.text((x, 168), "DISPLAY NAME", font=_font(True, 18), fill=GOLD)
+    dr.text((x, 192), (d["name"] or "-")[:26], font=_font(True, 44), fill=GOLD_L)
+
+    # status pill (top right)
+    dr.rounded_rectangle((740, 36, 960, 88), 26, fill=(40, 30, 14), outline=col, width=3)
+    dr.text((850, 62), lab, font=_font(True, 24), fill=col, anchor="mm")
+
+    # note box
+    dr.rounded_rectangle((x, 262, 950, 322), 30, fill=(24, 18, 10), outline=(90, 68, 30), width=2)
+    for i, line in enumerate(textwrap.wrap(note, 62)[:2]):
+        dr.text((x + 24, 276 + i * 22), line, font=_font(False, 18), fill=(215, 195, 160))
+
+    # stat boxes
+    stats = [("Reports", str(d["reports"]), (255, 255, 255)),
+             ("Verified", str(d["verified"]), (255, 255, 255)),
+             ("Status", d["status"].title() if d["status"] != "CLEAN" else "Clean", col)]
+    for i, (k, v, vc) in enumerate(stats):
+        bx = 55 + i * 310
+        dr.rounded_rectangle((bx, 350, bx + 270, 495), 26, fill=(26, 20, 12), outline=(110, 82, 36), width=2)
+        dr.text((bx + 135, 385), k, font=_font(True, 24), fill=MUTED, anchor="mm")
+        dr.text((bx + 135, 442), v, font=_font(True, 54 if len(v) < 6 else 40), fill=vc, anchor="mm")
+
+    dr.text((W // 2, 525), f"Powered by @{d['bot']}", font=_font(False, 18), fill=MUTED, anchor="mm")
+    out = io.BytesIO(); img.save(out, "PNG"); return out.getvalue()
+
+async def avatar_bytes(uid):
+    if not uid: return None
+    try:
+        ph = await pub.bot.get_user_profile_photos(uid, limit=1)
+        if not ph.photos: return None
+        f = await pub.bot.get_file(ph.photos[0][-1].file_id)
+        return bytes(await f.download_as_bytearray())
+    except TelegramError:
+        return None
+
+def status_data(t):
+    """-> list of dicts (one per matching person). Empty list if the account is unknown."""
+    t = t.strip().lstrip("@"); out = []
+    with Session() as s:
+        for sub in find_subjects(s, t)[:3]:
+            reps = (s.query(Report).filter(Report.subject_id == sub.id, Report.status.in_(PUBLISHED))
+                    .order_by(desc(Report.id)).all())
+            sts = {r.status for r in reps}
+            st = ("FLAGGED" if "VERIFIED" in sts else "DISPUTED" if "DISPUTED" in sts
+                  else "RESOLVED" if "RESOLVED" in sts else "CLEAN")
+            last = reps[0] if reps else None
+            out.append(dict(uid=sub.user_id, username=sub.username, name=sub.first_name, status=st,
+                            reports=len(reps), verified=sum(r.status == "VERIFIED" for r in reps),
+                            bot=PUB_USERNAME, rid=last.id if last else None,
+                            proof=(post_url(last) or last.proof_link) if last else None))
+    return out
+
+async def send_status(u, t):
+    rows = await asyncio.to_thread(status_data, t)
+    if not rows:                                     # unknown account -> clean card
+        t = t.strip().lstrip("@")
+        rows = [dict(uid=int(t) if t.isdigit() else None, username=None if t.isdigit() else t, name=None,
+                     status="CLEAN", reports=0, verified=0, bot=PUB_USERNAME, rid=None, proof=None)]
+    for d in rows:
+        png = await asyncio.to_thread(render_card, d, await avatar_bytes(d["uid"]))
+        prof = (f"https://t.me/{d['username']}" if d["username"]
+                else f"tg://user?id={d['uid']}" if d["uid"] else None)
+        kb = []
+        top = ([_IKB("View Profile", url=prof)] if prof else []) + \
+              ([_IKB("View Proof", url=d["proof"])] if d["proof"] else [])
+        if top: kb.append(top)
+        if d["rid"]: kb.append([_IKB("View Full Report", url=f"https://t.me/{PUB_USERNAME}?start=r{d['rid']}")])
+        kb.append([Btn("Report User", "pm:report")])
+        try:
+            await u.effective_message.reply_photo(io.BytesIO(png), reply_markup=Kb(kb))
+        except BadRequest:                           # e.g. tg://user link refused by privacy settings
+            await u.effective_message.reply_photo(io.BytesIO(png), reply_markup=Kb(kb[1:]))
+
 # ═════════════════════════ PUBLIC BOT ═════════════════════════
 TARGET, DEAL, REASON, PROOF, CONFIRM = range(5)
 
@@ -540,7 +669,7 @@ async def p_help(u, c):
     await say(u, "<b>How it works</b>\n1. File a report with proof (a link to a Telegram channel containing your proof).\n"
                  "2. An admin reviews it. If approved it's posted on the channel with your proof.\n"
                  "3. You get a message whenever the status changes, and admins may ask you for more info.\n\n"
-                 "<b>Commands</b>\n/report · /check · /my · /track &lt;id&gt; · /appeal &lt;id&gt; "
+                 "<b>Commands</b>\n/report · /status · /my · /track &lt;id&gt; · /appeal &lt;id&gt; "
                  "(if a report is about <i>you</i>) · /cancel", pub_home_kb())
 
 async def rep_start(u, c):
@@ -687,7 +816,7 @@ def report_card(s, r):
     L.append(f"⚖️ Disagree? /appeal {r.id}")
     return "\n".join(L)
 
-# ---- check ----
+# ---- check / status ----
 def subject_card(s, sub):
     reps = (s.query(Report).filter(Report.subject_id == sub.id, Report.status.in_(PUBLISHED))
             .order_by(desc(Report.created_at)).all())
@@ -709,11 +838,11 @@ def lookup_text(t):
         out = [x for x in (subject_card(s, sub) for sub in find_subjects(s, t)) if x]
     return "\n\n".join(out) or f"✅ No public reports for <b>{esc(t)}</b>."
 
-async def p_check(u, c):
+async def p_check(u, c):                              # /status (and the old /check alias)
     if not throttle(u.effective_user.id, "check", 20, 3600):
         await say(u, "Too many lookups - try again in a bit."); return
     if c.args:
-        await say(u, lookup_text(c.args[0])); return
+        await send_status(u, c.args[0]); return
     c.user_data["await"] = ("check", None)
     await say(u, "Send the @username or ID to look up.")
 
@@ -814,7 +943,7 @@ async def p_incoming(u, c):
         c.user_data.pop("await")
         if not throttle(usr.id, "check", 20, 3600):
             await say(u, "Too many lookups - try again in a bit."); return
-        await say(u, lookup_text(m.text), pub_home_kb()); return
+        await send_status(u, m.text); return
     if kind not in ("answer", "appeal"): return
     photo = m.photo[-1].file_id if m.photo else None
     if photo and kind == "appeal":
@@ -864,7 +993,7 @@ def register_public(app):
     app.add_handler(CommandHandler("start", p_start))
     app.add_handler(CommandHandler("help", p_help))
     app.add_handler(CommandHandler("cancel", p_cancel_any))
-    app.add_handler(CommandHandler("check", p_check))
+    app.add_handler(CommandHandler(["status", "check"], p_check))     # /check kept as an alias
     app.add_handler(CommandHandler("my", p_mine))
     app.add_handler(CommandHandler("track", p_track))
     app.add_handler(CommandHandler("appeal", p_appeal))
@@ -1336,7 +1465,7 @@ async def main():
         await a.initialize(); await a.start()
     PUB_USERNAME = pub.bot.username
     await pub.bot.set_my_commands([BotCommand("start", "Menu"), BotCommand("report", "File a report"),
-                                   BotCommand("check", "Look up a user"), BotCommand("my", "My reports"),
+                                   BotCommand("status", "Look up a user"), BotCommand("my", "My reports"),
                                    BotCommand("track", "Track a report by ID"),
                                    BotCommand("appeal", "Appeal a report about you"), BotCommand("cancel", "Cancel")])
     await adm.bot.set_my_commands([BotCommand("menu", "Admin panel"), BotCommand("export", "Export reports CSV"),
