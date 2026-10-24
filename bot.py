@@ -730,7 +730,7 @@ def render_card(d, avatar=None):
         dr.text((px(cxm), px(470)), v, font=F(True, size), fill=col if hot else WHITE, anchor="mm")
         _spaced(dr, px(cxm), px(515), k, F(True, 15), MUTED, px(3), anchor="m")
 
-    _spaced(dr, px(W / 2), px(574), f"POWERED BY @{d['bot'].upper()}", F(True, 13), DIM, px(2.5), anchor="m")
+    _spaced(dr, px(W / 2), px(574), "POWERED BY @SOWCO", F(True, 13), DIM, px(2.5), anchor="m")
 
     mask = Image.new("L", img.size, 0)
     ImageDraw.Draw(mask).rounded_rectangle((0, 0, px(W) - 1, px(H) - 1), px(34), fill=255)
