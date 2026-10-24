@@ -18,6 +18,7 @@ Optional env : CHANNEL_USERNAME, TRACK_INTERVAL_MIN (30), MAX_PENDING_PER_USER (
 Requires     : Pillow, telethon  (add both to requirements.txt)
 Optional     : fonts/Montserrat-Bold.ttf + fonts/Montserrat-Regular.ttf next to this file (nicer card text)
 
+v3.6: all-black glass card.
 v3.5.1: glass card rebuilt (vivid backdrop, real frosted panels) and ~10x faster (cached lookups + cards).
 v3.5 changes:
   1. "View Full Report" (channel post + /status card) now opens the PROOF CHANNEL link directly, not the bot.
@@ -632,7 +633,7 @@ CARD_STYLE = {   # status -> (badge text, accent colour, one-line note)
     "CLEAN":    ("NO REPORTS", (92, 168, 255),  "No public reports were found for this account."),
 }
 GLYPH = {"FLAGGED": "cross", "DISPUTED": "alert", "RESOLVED": "check", "CLEAN": "check"}
-BG, WHITE, MUTED, DIM = (11, 13, 19), (246, 248, 252), (176, 184, 204), (130, 138, 158)
+BG, WHITE, MUTED, DIM = (0, 0, 0), (246, 248, 252), (176, 184, 204), (130, 138, 158)
 
 def _font(bold, size):
     for p in (os.path.join(FONT_DIR, "Montserrat-Bold.ttf" if bold else "Montserrat-Regular.ttf"),
@@ -678,28 +679,8 @@ def _fast_blur(im, radius, f=4):
     return small.resize((w, h), Image.BILINEAR)
 
 def _backdrop(W, H, S, col, av):
-    """Vivid background for the glass to blur: soft colour wash + crisp glossy orbs peeking around the card."""
-    sw, sh = W // 4, H // 4
-    violet, cyan, pink = (150, 110, 255), (60, 205, 255), (255, 105, 190)
-    soft = Image.new("RGB", (sw, sh), BG)
-    sd = ImageDraw.Draw(soft)
-    for cx, cy, r, c in ((170, 130, 260, col), (880, 520, 300, violet), (840, 60, 200, cyan), (120, 570, 190, pink)):
-        sd.ellipse([(cx - r) / 4, (cy - r) / 4, (cx + r) / 4, (cy + r) / 4], fill=_mix(c, BG, 0.75))
-    soft = soft.filter(ImageFilter.GaussianBlur(14))
-    if av is not None:
-        small = ImageOps.fit(av, (sw, sh)).filter(ImageFilter.GaussianBlur(3))
-        soft = Image.blend(soft, small, 0.35)
-    base = soft.resize((W * S, H * S), Image.BICUBIC).convert("RGBA")
-    orbs = Image.new("RGBA", base.size, (0, 0, 0, 0))
-    od = ImageDraw.Draw(orbs)
-    for cx, cy, r, c in ((44, 66, 96, col), (958, 548, 122, violet), (910, 36, 62, cyan),
-                         (52, 566, 72, pink), (520, 330, 120, violet), (300, 500, 80, cyan)):
-        od.ellipse([(cx - r) * S, (cy - r) * S, (cx + r) * S, (cy + r) * S], fill=c + (235,))
-        od.ellipse([(cx - r * .62) * S, (cy - r * .78) * S, (cx + r * .1) * S, (cy - r * .05) * S],
-                   fill=(255, 255, 255, 46))                                   # glossy highlight
-    base = Image.alpha_composite(base, orbs)
-    shade = Image.linear_gradient("L").resize(base.size).point(lambda v: int(v * 0.25))
-    return Image.composite(Image.new("RGBA", base.size, BG + (255,)), base, shade)
+    """Solid black card background."""
+    return Image.new("RGBA", (W * S, H * S), BG + (255,))
 
 def _glass(img, box, r, S, a=20, tint=(232, 240, 255), blur=10, sheen=0.30, bcol=(255, 255, 255), shadow=True, light=False):
     """Frosted-glass panel drawn IN PLACE on an RGBA image: blurred + saturated backdrop, soft drop shadow,
@@ -750,7 +731,7 @@ def render_card(d, avatar=None):
         try: av = Image.open(io.BytesIO(avatar)).convert("RGB")
         except Exception: av = None
 
-    bgi = _load_bg(W * S, H * S)
+    bgi = None                                  # black card (wallpaper disabled)
     light = bgi is not None
     img = bgi.copy() if light else _backdrop(W, H, S, col, av)
     T, M, Dm = ((24, 28, 40), (74, 82, 100), (110, 118, 134)) if light else (WHITE, MUTED, (200, 208, 226))
