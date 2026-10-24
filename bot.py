@@ -18,7 +18,6 @@ Optional env : CHANNEL_USERNAME, TRACK_INTERVAL_MIN (30), MAX_PENDING_PER_USER (
 Requires     : Pillow, telethon  (add both to requirements.txt)
 Optional     : fonts/Montserrat-Bold.ttf + fonts/Montserrat-Regular.ttf next to this file (nicer card text)
 
-v3.6: all-black glass card.
 v3.5.1: glass card rebuilt (vivid backdrop, real frosted panels) and ~10x faster (cached lookups + cards).
 v3.5 changes:
   1. "View Full Report" (channel post + /status card) now opens the PROOF CHANNEL link directly, not the bot.
@@ -615,17 +614,6 @@ async def passive_track(u: Update, c):
 
 # ───────────────────────── /status profile card (image) ─────────────────────────
 FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
-BG_FILE = os.getenv("CARD_BG") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "card_bg.jpg")
-_BGC = {}
-def _load_bg(w, h):
-    """Card wallpaper (card_bg.jpg next to bot.py), cover-fitted once and cached. None -> old dark look."""
-    if (w, h) not in _BGC:
-        try:
-            im = ImageOps.fit(Image.open(BG_FILE).convert("RGB"), (w, h), Image.LANCZOS, centering=(0.5, 1.0))
-            _BGC[(w, h)] = im.convert("RGBA")
-        except Exception:
-            _BGC[(w, h)] = None
-    return _BGC[(w, h)]
 CARD_STYLE = {   # status -> (badge text, accent colour, one-line note)
     "FLAGGED":  ("FLAGGED",    (255, 82, 96),   "Verified timewaster reports exist. Deal with caution."),
     "DISPUTED": ("DISPUTED",   (255, 176, 46),  "Reports exist, but the case is currently disputed."),
@@ -633,7 +621,7 @@ CARD_STYLE = {   # status -> (badge text, accent colour, one-line note)
     "CLEAN":    ("NO REPORTS", (92, 168, 255),  "No public reports were found for this account."),
 }
 GLYPH = {"FLAGGED": "cross", "DISPUTED": "alert", "RESOLVED": "check", "CLEAN": "check"}
-BG, WHITE, MUTED, DIM = (0, 0, 0), (246, 248, 252), (176, 184, 204), (130, 138, 158)
+BG, WHITE, MUTED, DIM = (11, 13, 19), (246, 248, 252), (176, 184, 204), (130, 138, 158)
 
 def _font(bold, size):
     for p in (os.path.join(FONT_DIR, "Montserrat-Bold.ttf" if bold else "Montserrat-Regular.ttf"),
@@ -679,20 +667,38 @@ def _fast_blur(im, radius, f=4):
     return small.resize((w, h), Image.BILINEAR)
 
 def _backdrop(W, H, S, col, av):
-    """Solid black card background."""
-    return Image.new("RGBA", (W * S, H * S), BG + (255,))
+    """Vivid background for the glass to blur: soft colour wash + crisp glossy orbs peeking around the card."""
+    sw, sh = W // 4, H // 4
+    violet, cyan, pink = (150, 110, 255), (60, 205, 255), (255, 105, 190)
+    soft = Image.new("RGB", (sw, sh), BG)
+    sd = ImageDraw.Draw(soft)
+    for cx, cy, r, c in ((170, 130, 260, col), (880, 520, 300, violet), (840, 60, 200, cyan), (120, 570, 190, pink)):
+        sd.ellipse([(cx - r) / 4, (cy - r) / 4, (cx + r) / 4, (cy + r) / 4], fill=_mix(c, BG, 0.75))
+    soft = soft.filter(ImageFilter.GaussianBlur(14))
+    if av is not None:
+        small = ImageOps.fit(av, (sw, sh)).filter(ImageFilter.GaussianBlur(3))
+        soft = Image.blend(soft, small, 0.35)
+    base = soft.resize((W * S, H * S), Image.BICUBIC).convert("RGBA")
+    orbs = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    od = ImageDraw.Draw(orbs)
+    for cx, cy, r, c in ((44, 66, 96, col), (958, 548, 122, violet), (910, 36, 62, cyan),
+                         (52, 566, 72, pink), (520, 330, 120, violet), (300, 500, 80, cyan)):
+        od.ellipse([(cx - r) * S, (cy - r) * S, (cx + r) * S, (cy + r) * S], fill=c + (235,))
+        od.ellipse([(cx - r * .62) * S, (cy - r * .78) * S, (cx + r * .1) * S, (cy - r * .05) * S],
+                   fill=(255, 255, 255, 46))                                   # glossy highlight
+    base = Image.alpha_composite(base, orbs)
+    shade = Image.linear_gradient("L").resize(base.size).point(lambda v: int(v * 0.25))
+    return Image.composite(Image.new("RGBA", base.size, BG + (255,)), base, shade)
 
-def _glass(img, box, r, S, a=20, tint=(232, 240, 255), blur=10, sheen=0.30, bcol=(255, 255, 255), shadow=True, light=False):
+def _glass(img, box, r, S, a=20, tint=(232, 240, 255), blur=10, sheen=0.30, bcol=(255, 255, 255), shadow=True):
     """Frosted-glass panel drawn IN PLACE on an RGBA image: blurred + saturated backdrop, soft drop shadow,
     faint tint, diagonal highlight and a bright-to-dim gradient edge. Later panels blur earlier ones."""
-    if light:                                   # light wallpaper: keep the picture visible through the glass
-        blur, a, sheen = blur * 0.35, max(8, int(a * 0.5)), sheen * 0.8
     x0, y0, x1, y1 = [int(v * S) for v in box]
     w, h, rr = x1 - x0, y1 - y0, int(r * S)
     m = Image.new("L", (w, h), 0)
     ImageDraw.Draw(m).rounded_rectangle((0, 0, w - 1, h - 1), rr, fill=255)
     reg = _fast_blur(img.crop((x0, y0, x1, y1)).convert("RGB"), blur * S)       # taken BEFORE the shadow
-    if not light: reg = ImageEnhance.Brightness(ImageEnhance.Color(reg).enhance(1.4)).enhance(1.12)
+    reg = ImageEnhance.Brightness(ImageEnhance.Color(reg).enhance(1.4)).enhance(1.12)
     if shadow:
         pad, off = 16 * S, 7 * S
         sm = Image.new("L", ((w + 2 * pad) // 4, (h + 2 * pad) // 4), 0)
@@ -700,8 +706,6 @@ def _glass(img, box, r, S, a=20, tint=(232, 240, 255), blur=10, sheen=0.30, bcol
                                              max(1, rr // 4), fill=110)
         sm = sm.filter(ImageFilter.GaussianBlur(max(1, 7 * S // 4))).resize((w + 2 * pad, h + 2 * pad), Image.BILINEAR)
         img.paste((0, 0, 0, 255), (x0 - pad, y0 - pad), sm)
-    if light:                                                                    # soft dark hairline so glass reads on a light wallpaper
-        ImageDraw.Draw(img, "RGBA").rounded_rectangle((x0 - 1, y0 - 1, x1, y1), rr + 1, outline=(30, 36, 56, 70), width=max(1, S // 2))
     img.paste(reg, (x0, y0), m)
     g = Image.linear_gradient("L")
     diag = ImageChops.add(ImageOps.invert(g).resize((w, h)),
@@ -731,20 +735,14 @@ def render_card(d, avatar=None):
         try: av = Image.open(io.BytesIO(avatar)).convert("RGB")
         except Exception: av = None
 
-    bgi = None                                  # black card (wallpaper disabled)
-    light = bgi is not None
-    img = bgi.copy() if light else _backdrop(W, H, S, col, av)
-    T, M, Dm = ((24, 28, 40), (74, 82, 100), (110, 118, 134)) if light else (WHITE, MUTED, (200, 208, 226))
-    LBL = (60, 68, 86) if light else (236, 241, 252)
-    acc = _mix(col, (0, 0, 0), 0.8) if light else _mix(col, (255, 255, 255), 0.75)
-    G = lambda box, r, **k: _glass(img, box, r, S, light=light, **k)
+    img = _backdrop(W, H, S, col, av)
     meas = ImageDraw.Draw(img)
     tw = lambda text, font: meas.textlength(text, font=font) / S          # width in card units
 
     # coloured glow behind the avatar
     D, ax, ay = 220, 70, 110
     gm = Image.new("L", (W * S // 4, H * S // 4), 0)
-    ImageDraw.Draw(gm).ellipse([(ax - 8) * S / 4, (ay - 8) * S / 4, (ax + D + 8) * S / 4, (ay + D + 8) * S / 4], fill=(110 if light else 170))
+    ImageDraw.Draw(gm).ellipse([(ax - 8) * S / 4, (ay - 8) * S / 4, (ax + D + 8) * S / 4, (ay + D + 8) * S / 4], fill=170)
     gm = gm.filter(ImageFilter.GaussianBlur(7)).resize(img.size, Image.BILINEAR)
     img.paste(col + (255,), (0, 0), gm)
 
@@ -761,24 +759,24 @@ def render_card(d, avatar=None):
     pw = (W - 140 - 40) / 3
 
     # ---- ALL glass first (so nothing blurs the text) ----
-    G((24, 20, W - 24, H - 20), 40, a=14, blur=9, sheen=0.28)                      # main card
-    G((56, 28, 96 + head_w + 18, 68), 20, a=26, blur=5, shadow=False)              # header chip
-    G((W - 70 - bot_w - 18, 28, W - 52, 68), 20, a=26, blur=5, shadow=False)       # bot chip
-    G((ax - 16, ay - 16, ax + D + 16, ay + D + 16), (D + 32) / 2, a=22, blur=7)    # avatar ring
-    G((X, 226, X + id_w, 268), 21, a=28, blur=5, shadow=False)                     # ID chip
-    G((X, 296, X + pill_w, 350), 27, a=100, tint=col, bcol=_mix(col, (255, 255, 255), 0.5),
+    _glass(img, (24, 20, W - 24, H - 20), 40, S, a=14, blur=9, sheen=0.28)                      # main card
+    _glass(img, (56, 28, 96 + head_w + 18, 68), 20, S, a=26, blur=5, shadow=False)              # header chip
+    _glass(img, (W - 70 - bot_w - 18, 28, W - 52, 68), 20, S, a=26, blur=5, shadow=False)       # bot chip
+    _glass(img, (ax - 16, ay - 16, ax + D + 16, ay + D + 16), (D + 32) / 2, S, a=22, blur=7)    # avatar ring
+    _glass(img, (X, 226, X + id_w, 268), 21, S, a=28, blur=5, shadow=False)                     # ID chip
+    _glass(img, (X, 296, X + pill_w, 350), 27, S, a=100, tint=col, bcol=_mix(col, (255, 255, 255), 0.5),
            blur=5, shadow=False)                                                                # status pill
     for i in range(3):                                                                          # stat panels
         x0 = 70 + i * (pw + 20)
-        G((x0, 420, x0 + pw, 540), 24, a=20, blur=7)
+        _glass(img, (x0, 420, x0 + pw, 540), 24, S, a=20, blur=7)
 
     dr = ImageDraw.Draw(img, "RGBA")
-    dr.line([px(70), px(88), px(W - 70), px(88)], fill=((30, 36, 56, 50) if light else (255, 255, 255, 40)), width=S)            # header rule
+    dr.line([px(70), px(88), px(W - 70), px(88)], fill=(255, 255, 255, 40), width=S)            # header rule
 
     # header
     dr.ellipse((px(70), px(42), px(82), px(54)), fill=col)
-    _spaced(dr, px(96), px(48), head_txt, f_h, T, px(3))
-    dr.text((px(W - 70), px(48)), bot_txt, font=f_b, fill=T, anchor="rm")
+    _spaced(dr, px(96), px(48), head_txt, f_h, WHITE, px(3))
+    dr.text((px(W - 70), px(48)), bot_txt, font=f_b, fill=WHITE, anchor="rm")
 
     # avatar (inside the glass ring)
     if av is not None:
@@ -793,28 +791,28 @@ def render_card(d, avatar=None):
 
     # name / @username / ID
     f_name = F(True, 54)
-    dr.text((px(X), px(150)), _fit(dr, d["name"] or "Unknown", f_name, px(W - X - 60)), font=f_name, fill=T, anchor="lm")
+    dr.text((px(X), px(150)), _fit(dr, d["name"] or "Unknown", f_name, px(W - X - 60)), font=f_name, fill=WHITE, anchor="lm")
     if d.get("username"):
         f_u = F(True, 29)
         main = f"@{d['username']}"
-        dr.text((px(X), px(204)), main, font=f_u, fill=acc, anchor="lm")
+        dr.text((px(X), px(204)), main, font=f_u, fill=_mix(col, (255, 255, 255), 0.75), anchor="lm")
         alts = d.get("alts") or []
         if alts:
             x_extra = X + tw(main, f_u) + 18
             extra = "aka " + ", ".join("@" + a for a in alts)
             f_x = F(False, 20)
-            dr.text((px(x_extra), px(206)), _fit(dr, extra, f_x, px(W - 60 - x_extra)), font=f_x, fill=M, anchor="lm")
+            dr.text((px(x_extra), px(206)), _fit(dr, extra, f_x, px(W - 60 - x_extra)), font=f_x, fill=MUTED, anchor="lm")
     else:
-        dr.text((px(X), px(204)), "no username", font=F(False, 27), fill=M, anchor="lm")
-    dr.text((px(X + 20), px(247)), id_txt, font=f_id, fill=T, anchor="lm")
+        dr.text((px(X), px(204)), "no username", font=F(False, 27), fill=MUTED, anchor="lm")
+    dr.text((px(X + 20), px(247)), id_txt, font=f_id, fill=WHITE, anchor="lm")
 
     # status pill + note
     cx, cy, cr = X + 29, 323, 19
     dr.ellipse((px(cx - cr), px(cy - cr), px(cx + cr), px(cy + cr)), fill=col)
     _glyph(dr, kind, px(cx), px(cy), px(cr), (14, 16, 22))
-    dr.text((px(X + 58), px(323)), lab, font=f_pill, fill=acc, anchor="lm")
+    dr.text((px(X + 58), px(323)), lab, font=f_pill, fill=WHITE, anchor="lm")
     f_n = F(False, 21)
-    dr.text((px(X), px(378)), _fit(dr, note, f_n, px(W - X - 60)), font=f_n, fill=T, anchor="lm")
+    dr.text((px(X), px(378)), _fit(dr, note, f_n, px(W - X - 60)), font=f_n, fill=WHITE, anchor="lm")
 
     # stats
     stats = [(str(d["reports"]), "REPORTS"), (str(d["verified"]), "VERIFIED"), (d.get("last") or "—", "LAST REPORT")]
@@ -822,11 +820,10 @@ def render_card(d, avatar=None):
         cxm = 70 + i * (pw + 20) + pw / 2
         hot = d["reports"] > 0 and i < 2
         size = 54 if len(v) < 8 else 34
-        dr.text((px(cxm), px(470)), v, font=F(True, size), fill=acc if hot else T, anchor="mm")
-        _spaced(dr, px(cxm), px(515), k, F(True, 15), LBL, px(3), anchor="m")
+        dr.text((px(cxm), px(470)), v, font=F(True, size), fill=_mix(col, (255, 255, 255), 0.7) if hot else WHITE, anchor="mm")
+        _spaced(dr, px(cxm), px(515), k, F(True, 15), (236, 241, 252), px(3), anchor="m")
 
-    if light: _spaced(dr, px(70), px(562), "POWERED BY @SOWCO", F(True, 13), Dm, px(2.5))     # keep the puppy's face clear
-    else: _spaced(dr, px(W / 2), px(562), "POWERED BY @SOWCO", F(True, 13), Dm, px(2.5), anchor="m")
+    _spaced(dr, px(W / 2), px(562), "POWERED BY @SOWCO", F(True, 13), (200, 208, 226), px(2.5), anchor="m")
 
     mask = Image.new("L", img.size, 0)
     ImageDraw.Draw(mask).rounded_rectangle((0, 0, px(W) - 1, px(H) - 1), px(34), fill=255)
