@@ -838,7 +838,7 @@ async def card_png(d, photo):
            d.get("last"), tuple(d.get("alts") or ()), hash(photo) if photo else None)
     hit = _CARDS.get(key)
     if hit and time.time() - hit[0] < 600: return hit[1]
-    png = await card_png(d, photo)
+    png = await asyncio.to_thread(render_card, d, photo)
     if len(_CARDS) > 100: _CARDS.clear()
     _CARDS[key] = (time.time(), png)
     return png
