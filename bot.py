@@ -18,6 +18,7 @@ Optional env : CHANNEL_USERNAME, TRACK_INTERVAL_MIN (30), MAX_PENDING_PER_USER (
 Requires     : Pillow, telethon  (add both to requirements.txt)
 Optional     : fonts/Montserrat-Bold.ttf + fonts/Montserrat-Regular.ttf next to this file (nicer card text)
 
+v3.5.1: glass card rebuilt (vivid backdrop, real frosted panels) and ~10x faster (cached lookups + cards).
 v3.5 changes:
   1. "View Full Report" (channel post + /status card) now opens the PROOF CHANNEL link directly, not the bot.
   2. "View post" links always use the public https://t.me/<username>/<id> format (the channel's @ is
@@ -387,7 +388,19 @@ async def start_lookup():
     except Exception:
         log.exception("lookup start")
 
+_LK = {}
 async def lookup_user(target):
+    """Cached wrapper: the same lookup within 5 minutes is answered instantly."""
+    key = str(target).lstrip("@").lower()
+    hit = _LK.get(key)
+    if hit and time.time() - hit[0] < 300: return hit[1]
+    info = await _lookup_user_raw(target)
+    if info:
+        if len(_LK) > 200: _LK.clear()
+        _LK[key] = (time.time(), info)
+    return info
+
+async def _lookup_user_raw(target):
     """@username (str) or numeric ID (int) -> dict(uid, username, names, name, photo) or None.
     `username` is the best @ to show; `names` are the person's other active usernames."""
     cl = LOOKUP["client"]
@@ -646,45 +659,71 @@ def _glyph(dr, kind, cx, cy, r, color):
         dr.line([(cx, cy - r * .45), (cx, cy + r * .12)], fill=color, width=w)
         dr.ellipse((cx - w * .62, cy + r * .34 - w * .62, cx + w * .62, cy + r * .34 + w * .62), fill=color)
 
-def _backdrop(W, H, S, col, av):
-    """Colourful background for the glass to blur: blurred avatar + glowing colour blobs."""
-    base = Image.new("RGB", (W * S, H * S), BG)
-    if av is not None:
-        small = ImageOps.fit(av, (W // 5, H // 5)).filter(ImageFilter.GaussianBlur(10))
-        base = Image.blend(base, small.resize((W * S, H * S), Image.LANCZOS), 0.45)
-    blobs = Image.new("RGBA", base.size, (0, 0, 0, 0))
-    bd = ImageDraw.Draw(blobs)
-    violet, cyan = (150, 110, 255), (60, 205, 255)
-    for cx, cy, r, c, a in ((170, 130, 270, col, 175), (860, 520, 310, violet, 150),
-                            (830, 60, 210, cyan, 110), (110, 570, 190, cyan, 85)):
-        bd.ellipse([(cx - r) * S, (cy - r) * S, (cx + r) * S, (cy + r) * S], fill=c + (a,))
-    blobs = blobs.filter(ImageFilter.GaussianBlur(70 * S))
-    base = Image.alpha_composite(base.convert("RGBA"), blobs).convert("RGB")
-    shade = Image.linear_gradient("L").resize(base.size).point(lambda v: int(v * 0.35))
-    return Image.composite(Image.new("RGB", base.size, BG), base, shade)
+def _fast_blur(im, radius, f=4):
+    """Gaussian blur done at 1/f size then scaled back up: looks the same, many times faster."""
+    w, h = im.size
+    small = im.resize((max(1, w // f), max(1, h // f)), Image.BILINEAR)
+    small = small.filter(ImageFilter.GaussianBlur(max(0.6, radius / f)))
+    return small.resize((w, h), Image.BILINEAR)
 
-def _glass(img, box, r, S, a=34, tint=(255, 255, 255), border=(255, 255, 255, 95), blur=14, sheen=0.20):
-    """Draw a frosted-glass panel IN PLACE on an RGBA image: blur what is underneath, add a translucent
-    tint, a soft top highlight and a light border. Panels drawn later blur the panels drawn before."""
+def _backdrop(W, H, S, col, av):
+    """Vivid background for the glass to blur: soft colour wash + crisp glossy orbs peeking around the card."""
+    sw, sh = W // 4, H // 4
+    violet, cyan, pink = (150, 110, 255), (60, 205, 255), (255, 105, 190)
+    soft = Image.new("RGB", (sw, sh), BG)
+    sd = ImageDraw.Draw(soft)
+    for cx, cy, r, c in ((170, 130, 260, col), (880, 520, 300, violet), (840, 60, 200, cyan), (120, 570, 190, pink)):
+        sd.ellipse([(cx - r) / 4, (cy - r) / 4, (cx + r) / 4, (cy + r) / 4], fill=_mix(c, BG, 0.75))
+    soft = soft.filter(ImageFilter.GaussianBlur(14))
+    if av is not None:
+        small = ImageOps.fit(av, (sw, sh)).filter(ImageFilter.GaussianBlur(3))
+        soft = Image.blend(soft, small, 0.35)
+    base = soft.resize((W * S, H * S), Image.BICUBIC).convert("RGBA")
+    orbs = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    od = ImageDraw.Draw(orbs)
+    for cx, cy, r, c in ((44, 66, 96, col), (958, 548, 122, violet), (910, 36, 62, cyan),
+                         (52, 566, 72, pink), (520, 330, 120, violet), (300, 500, 80, cyan)):
+        od.ellipse([(cx - r) * S, (cy - r) * S, (cx + r) * S, (cy + r) * S], fill=c + (235,))
+        od.ellipse([(cx - r * .62) * S, (cy - r * .78) * S, (cx + r * .1) * S, (cy - r * .05) * S],
+                   fill=(255, 255, 255, 46))                                   # glossy highlight
+    base = Image.alpha_composite(base, orbs)
+    shade = Image.linear_gradient("L").resize(base.size).point(lambda v: int(v * 0.25))
+    return Image.composite(Image.new("RGBA", base.size, BG + (255,)), base, shade)
+
+def _glass(img, box, r, S, a=20, tint=(232, 240, 255), blur=10, sheen=0.30, bcol=(255, 255, 255), shadow=True):
+    """Frosted-glass panel drawn IN PLACE on an RGBA image: blurred + saturated backdrop, soft drop shadow,
+    faint tint, diagonal highlight and a bright-to-dim gradient edge. Later panels blur earlier ones."""
     x0, y0, x1, y1 = [int(v * S) for v in box]
-    w, h = x1 - x0, y1 - y0
-    reg = img.crop((x0, y0, x1, y1)).filter(ImageFilter.GaussianBlur(blur * S))
-    reg = ImageEnhance.Brightness(reg).enhance(1.10)
+    w, h, rr = x1 - x0, y1 - y0, int(r * S)
     m = Image.new("L", (w, h), 0)
-    ImageDraw.Draw(m).rounded_rectangle((0, 0, w - 1, h - 1), int(r * S), fill=255)
+    ImageDraw.Draw(m).rounded_rectangle((0, 0, w - 1, h - 1), rr, fill=255)
+    reg = _fast_blur(img.crop((x0, y0, x1, y1)).convert("RGB"), blur * S)       # taken BEFORE the shadow
+    reg = ImageEnhance.Brightness(ImageEnhance.Color(reg).enhance(1.4)).enhance(1.12)
+    if shadow:
+        pad, off = 16 * S, 7 * S
+        sm = Image.new("L", ((w + 2 * pad) // 4, (h + 2 * pad) // 4), 0)
+        ImageDraw.Draw(sm).rounded_rectangle((pad // 4, (pad + off) // 4, (pad + w) // 4, (pad + off + h) // 4),
+                                             max(1, rr // 4), fill=110)
+        sm = sm.filter(ImageFilter.GaussianBlur(max(1, 7 * S // 4))).resize((w + 2 * pad, h + 2 * pad), Image.BILINEAR)
+        img.paste((0, 0, 0, 255), (x0 - pad, y0 - pad), sm)
     img.paste(reg, (x0, y0), m)
+    g = Image.linear_gradient("L")
+    diag = ImageChops.add(ImageOps.invert(g).resize((w, h)),
+                          ImageOps.invert(g.rotate(90)).resize((w, h)), scale=2)   # bright top-left -> dim bottom-right
     layer = Image.new("RGBA", (w, h), tint + (a,))
-    top = ImageOps.flip(Image.linear_gradient("L").resize((w, h))).point(lambda v: int(v * sheen))
-    shine = Image.new("RGBA", (w, h), (255, 255, 255, 0)); shine.putalpha(top)
+    shine = Image.new("RGBA", (w, h), (255, 255, 255, 0)); shine.putalpha(diag.point(lambda v: int(v * sheen)))
     layer = Image.alpha_composite(layer, shine)
+    bm = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(bm).rounded_rectangle((0, 0, w - 1, h - 1), rr, outline=255, width=max(2, int(1.6 * S)))
+    edge = Image.new("RGBA", (w, h), bcol + (0,))
+    edge.putalpha(ImageChops.multiply(bm, diag.point(lambda v: 45 + int(v * 0.75))))
+    layer = Image.alpha_composite(layer, edge)
     layer.putalpha(ImageChops.multiply(layer.getchannel("A"), m))
     img.alpha_composite(layer, (x0, y0))
-    ImageDraw.Draw(img, "RGBA").rounded_rectangle((x0, y0, x1 - 1, y1 - 1), int(r * S),
-                                                  outline=border, width=max(1, S))
 
 def render_card(d, avatar=None):
     """Status card, all glass. d = dict(username, alts, name, uid, status, reports, verified, last, bot).
-    Returns PNG bytes."""
+    Returns JPEG bytes (small = fast upload)."""
     W, H, S = 1000, 600, 2                                    # drawn at 2x, shrunk at the end for smooth edges
     px = lambda v: int(v * S)
     lab, col, note = CARD_STYLE[d["status"]]
@@ -696,15 +735,16 @@ def render_card(d, avatar=None):
         try: av = Image.open(io.BytesIO(avatar)).convert("RGB")
         except Exception: av = None
 
-    base = _backdrop(W, H, S, col, av).convert("RGBA")
-    meas = ImageDraw.Draw(base)
+    img = _backdrop(W, H, S, col, av)
+    meas = ImageDraw.Draw(img)
     tw = lambda text, font: meas.textlength(text, font=font) / S          # width in card units
 
-    # coloured glow behind the avatar (gives the glass something bright to blur)
+    # coloured glow behind the avatar
     D, ax, ay = 220, 70, 110
-    glow = Image.new("RGBA", base.size, (0, 0, 0, 0))
-    ImageDraw.Draw(glow).ellipse([px(ax - 8), px(ay - 8), px(ax + D + 8), px(ay + D + 8)], fill=col + (150,))
-    img = Image.alpha_composite(base, glow.filter(ImageFilter.GaussianBlur(px(26))))
+    gm = Image.new("L", (W * S // 4, H * S // 4), 0)
+    ImageDraw.Draw(gm).ellipse([(ax - 8) * S / 4, (ay - 8) * S / 4, (ax + D + 8) * S / 4, (ay + D + 8) * S / 4], fill=170)
+    gm = gm.filter(ImageFilter.GaussianBlur(7)).resize(img.size, Image.BILINEAR)
+    img.paste(col + (255,), (0, 0), gm)
 
     X = 340                                                    # right column start
     f_id = F(False, 21)
@@ -718,26 +758,27 @@ def render_card(d, avatar=None):
     bot_w = tw(bot_txt, f_b)
     pw = (W - 140 - 40) / 3
 
-    # ---- ALL glass first (so nothing blurs text) ----
-    _glass(img, (24, 20, W - 24, H - 20), 40, S, a=26, blur=22, sheen=0.16)              # main card
-    _glass(img, (56, 28, 96 + head_w + 18, 68), 20, S, a=30, blur=8)                      # header chip
-    _glass(img, (W - 70 - bot_w - 18, 28, W - 52, 68), 20, S, a=30, blur=8)               # bot chip
-    _glass(img, (ax - 16, ay - 16, ax + D + 16, ay + D + 16), (D + 32) / 2, S, a=30, blur=10)  # avatar ring
-    _glass(img, (X, 226, X + id_w, 268), 21, S, a=30, blur=8)                             # ID chip
-    _glass(img, (X, 296, X + pill_w, 350), 27, S, a=70, tint=col, border=col + (230,), blur=8)  # status pill
-    for i in range(3):                                                                    # stat panels
+    # ---- ALL glass first (so nothing blurs the text) ----
+    _glass(img, (24, 20, W - 24, H - 20), 40, S, a=14, blur=9, sheen=0.28)                      # main card
+    _glass(img, (56, 28, 96 + head_w + 18, 68), 20, S, a=26, blur=5, shadow=False)              # header chip
+    _glass(img, (W - 70 - bot_w - 18, 28, W - 52, 68), 20, S, a=26, blur=5, shadow=False)       # bot chip
+    _glass(img, (ax - 16, ay - 16, ax + D + 16, ay + D + 16), (D + 32) / 2, S, a=22, blur=7)    # avatar ring
+    _glass(img, (X, 226, X + id_w, 268), 21, S, a=28, blur=5, shadow=False)                     # ID chip
+    _glass(img, (X, 296, X + pill_w, 350), 27, S, a=100, tint=col, bcol=_mix(col, (255, 255, 255), 0.5),
+           blur=5, shadow=False)                                                                # status pill
+    for i in range(3):                                                                          # stat panels
         x0 = 70 + i * (pw + 20)
-        _glass(img, (x0, 420, x0 + pw, 540), 24, S, a=32, blur=12)
+        _glass(img, (x0, 420, x0 + pw, 540), 24, S, a=20, blur=7)
 
     dr = ImageDraw.Draw(img, "RGBA")
-    dr.line([px(70), px(88), px(W - 70), px(88)], fill=(255, 255, 255, 34), width=S)      # header rule
+    dr.line([px(70), px(88), px(W - 70), px(88)], fill=(255, 255, 255, 40), width=S)            # header rule
 
     # header
     dr.ellipse((px(70), px(42), px(82), px(54)), fill=col)
     _spaced(dr, px(96), px(48), head_txt, f_h, WHITE, px(3))
     dr.text((px(W - 70), px(48)), bot_txt, font=f_b, fill=WHITE, anchor="rm")
 
-    # avatar (sits inside the glass ring)
+    # avatar (inside the glass ring)
     if av is not None:
         pic = ImageOps.fit(av, (px(D), px(D)))
     else:
@@ -754,7 +795,7 @@ def render_card(d, avatar=None):
     if d.get("username"):
         f_u = F(True, 29)
         main = f"@{d['username']}"
-        dr.text((px(X), px(204)), main, font=f_u, fill=col, anchor="lm")
+        dr.text((px(X), px(204)), main, font=f_u, fill=_mix(col, (255, 255, 255), 0.75), anchor="lm")
         alts = d.get("alts") or []
         if alts:
             x_extra = X + tw(main, f_u) + 18
@@ -771,7 +812,7 @@ def render_card(d, avatar=None):
     _glyph(dr, kind, px(cx), px(cy), px(cr), (14, 16, 22))
     dr.text((px(X + 58), px(323)), lab, font=f_pill, fill=WHITE, anchor="lm")
     f_n = F(False, 21)
-    dr.text((px(X), px(378)), _fit(dr, note, f_n, px(W - X - 60)), font=f_n, fill=MUTED, anchor="lm")
+    dr.text((px(X), px(378)), _fit(dr, note, f_n, px(W - X - 60)), font=f_n, fill=WHITE, anchor="lm")
 
     # stats
     stats = [(str(d["reports"]), "REPORTS"), (str(d["verified"]), "VERIFIED"), (d.get("last") or "—", "LAST REPORT")]
@@ -779,16 +820,28 @@ def render_card(d, avatar=None):
         cxm = 70 + i * (pw + 20) + pw / 2
         hot = d["reports"] > 0 and i < 2
         size = 54 if len(v) < 8 else 34
-        dr.text((px(cxm), px(470)), v, font=F(True, size), fill=col if hot else WHITE, anchor="mm")
-        _spaced(dr, px(cxm), px(515), k, F(True, 15), MUTED, px(3), anchor="m")
+        dr.text((px(cxm), px(470)), v, font=F(True, size), fill=_mix(col, (255, 255, 255), 0.7) if hot else WHITE, anchor="mm")
+        _spaced(dr, px(cxm), px(515), k, F(True, 15), (236, 241, 252), px(3), anchor="m")
 
-    _spaced(dr, px(W / 2), px(562), "POWERED BY @SOWCO", F(True, 13), DIM, px(2.5), anchor="m")
+    _spaced(dr, px(W / 2), px(562), "POWERED BY @SOWCO", F(True, 13), (200, 208, 226), px(2.5), anchor="m")
 
     mask = Image.new("L", img.size, 0)
     ImageDraw.Draw(mask).rounded_rectangle((0, 0, px(W) - 1, px(H) - 1), px(34), fill=255)
     out = Image.new("RGB", img.size, BG); out.paste(img.convert("RGB"), (0, 0), mask)
     out = out.resize((W, H), Image.LANCZOS)
-    buf = io.BytesIO(); out.save(buf, "PNG"); return buf.getvalue()
+    buf = io.BytesIO(); out.save(buf, "JPEG", quality=93, subsampling=0); return buf.getvalue()
+
+_CARDS = {}
+async def card_png(d, photo):
+    """Render the card in a worker thread; identical cards are reused for 10 minutes (instant)."""
+    key = (d.get("uid"), d.get("username"), d.get("name"), d["status"], d["reports"], d["verified"],
+           d.get("last"), tuple(d.get("alts") or ()), hash(photo) if photo else None)
+    hit = _CARDS.get(key)
+    if hit and time.time() - hit[0] < 600: return hit[1]
+    png = await card_png(d, photo)
+    if len(_CARDS) > 100: _CARDS.clear()
+    _CARDS[key] = (time.time(), png)
+    return png
 
 async def avatar_bytes(uid):
     """Fallback avatar via the bot (only works for users who have talked to the bot)."""
@@ -845,7 +898,7 @@ async def send_status(u, t):
                 alts.append(n)
         d["alts"] = alts[:3]
         photo = photo or await avatar_bytes(d["uid"])
-        png = await asyncio.to_thread(render_card, d, photo)
+        png = await card_png(d, photo)
         if not private:                                               # groups / supergroups: image only, no buttons
             await u.effective_message.reply_photo(io.BytesIO(png)); continue
         prof = (f"https://t.me/{d['username']}" if d["username"]
