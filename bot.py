@@ -1,5 +1,5 @@
 """
-Timewaster Tracker v3.3  -  two Telegram bots in one process.
+Timewaster Tracker v3.4  -  two Telegram bots in one process.
 
 PUBLIC BOT  (BOT_TOKEN)        : file reports, /status users (image card), track / withdraw your reports,
                                  answer admin questions, appeal a report against you.
@@ -12,15 +12,16 @@ LOOKUP ACCOUNT (Telethon)      : a spare normal Telegram account that can resolv
                                  into numeric ID + name + profile picture (bots cannot do this).
 
 Required env : BOT_TOKEN, ADMIN_BOT_TOKEN, CHANNEL_ID, DATABASE_URL, ADMIN_IDS
-Lookup env   : TG_API_ID, TG_API_HASH, TG_SESSION   (from my.telegram.org + a StringSession; see notes)
+Lookup env   : TG_API_ID, TG_API_HASH, TG_SESSION   (from my.telegram.org + a StringSession)
 Optional env : CHANNEL_USERNAME, TRACK_INTERVAL_MIN (30), MAX_PENDING_PER_USER (3),
                REPORT_COOLDOWN_MIN (10), MAX_REPORTS_PER_DAY (5), REMIND_AFTER_HOURS (24), PORT
 Requires     : Pillow, telethon  (add both to requirements.txt)
 Optional     : fonts/Montserrat-Bold.ttf + fonts/Montserrat-Regular.ttf next to this file (nicer card text)
 
-v3.3 changes: /status now uses a Telethon lookup account, so ANY public @username (or an ID the lookup
-account has seen) shows its real name, numeric ID and profile picture on the card. Reports also capture the
-numeric ID automatically when the reporter types only an @username.
+v3.4 changes: brand-new /status card (blurred-avatar backdrop, glow ring, status badge with icon, glass stat
+panels). Fixed "no username" for people whose @ is a collectible / extra username (Telegram now lets one
+account own several usernames; the lookup now reads all of them and shows the extras as "aka").
+v3.3 changes: Telethon lookup account for name / ID / photo.
 v3.2 changes: /check is now /status and answers with a generated profile card image.
 v3.1 changes: automatic column migration, DB self-check at startup, /dbtest, safer passive_track.
 Proof is a Telegram channel link only (no screenshots in the report wizard).
@@ -33,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from sqlalchemy import (create_engine, inspect, text as sql_text, Column, Integer, BigInteger, String,
                         Text, DateTime, JSON, Boolean, ForeignKey, func, desc)
 from sqlalchemy.orm import declarative_base, sessionmaker
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter
 from telegram import (Update, InlineKeyboardButton as _IKB, InlineKeyboardMarkup as Kb,
                       InputMediaPhoto, BotCommand, LinkPreviewOptions,
                       MessageOriginUser, MessageOriginHiddenUser)
@@ -56,7 +57,7 @@ def Btn(text, data):
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("tw")
-logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)          # keeps bot tokens out of the logs
 
 # ───────────────────────── config ─────────────────────────
 def need(name):
@@ -362,16 +363,30 @@ async def start_lookup():
         log.exception("lookup start")
 
 async def lookup_user(target):
-    """@username (str) or numeric ID (int) -> dict(uid, username, name, photo) or None."""
+    """@username (str) or numeric ID (int) -> dict(uid, username, names, name, photo) or None.
+    `username` is the best @ to show; `names` are the person's other active usernames."""
     cl = LOOKUP["client"]
     if not cl: return None
     try:
         ent = await cl.get_entity(target)
         if not isinstance(ent, TLUser): return None
         name = " ".join(x for x in (ent.first_name, ent.last_name) if x) or None
+        # Telegram lets one account own several usernames (collectibles): `ent.username` can be empty
+        # even though the person has usernames, so read the full list too.
+        allnames = []
+        for n in ([ent.username] if ent.username else []) + \
+                 [u.username for u in (getattr(ent, "usernames", None) or []) if getattr(u, "active", True) and u.username]:
+            if n and n.lower() not in [x.lower() for x in allnames]: allnames.append(n)
+        primary = None
+        if isinstance(target, str):                         # prefer the @ the user typed, if it belongs to them
+            t = target.lstrip("@").lower()
+            primary = next((n for n in allnames if n.lower() == t), None)
+        primary = primary or (allnames[0] if allnames else None)
+        if not primary and isinstance(target, str): primary = target.lstrip("@")   # it resolved, so it's theirs
+        extras = [n for n in allnames if not primary or n.lower() != primary.lower()]
         try: photo = await cl.download_profile_photo(ent, file=bytes)
         except Exception: photo = None
-        return dict(uid=ent.id, username=ent.username, name=name, photo=photo or None)
+        return dict(uid=ent.id, username=primary, names=extras, name=name, photo=photo or None)
     except Exception as e:
         log.info("lookup %s failed: %s", target, e)
         return None
@@ -560,12 +575,13 @@ async def passive_track(u: Update, c):
 # ───────────────────────── /status profile card (image) ─────────────────────────
 FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 CARD_STYLE = {   # status -> (badge text, accent colour, one-line note)
-    "FLAGGED":  ("FLAGGED",    (239, 83, 80),   "Verified timewaster reports exist. Deal with caution."),
-    "DISPUTED": ("DISPUTED",   (255, 167, 38),  "Reports exist, but the case is currently disputed."),
-    "RESOLVED": ("RESOLVED",   (102, 187, 106), "Previously reported, but the case has been resolved."),
-    "CLEAN":    ("NO REPORTS", (100, 181, 246), "No public reports were found for this account."),
+    "FLAGGED":  ("FLAGGED",    (255, 82, 96),   "Verified timewaster reports exist. Deal with caution."),
+    "DISPUTED": ("DISPUTED",   (255, 176, 46),  "Reports exist, but the case is currently disputed."),
+    "RESOLVED": ("RESOLVED",   (56, 208, 148),  "Previously reported, but the case has been resolved."),
+    "CLEAN":    ("NO REPORTS", (92, 168, 255),  "No public reports were found for this account."),
 }
-BG, PANEL, WHITE, MUTED, LINE = (15, 17, 23), (24, 27, 36), (245, 247, 250), (140, 148, 163), (44, 48, 60)
+GLYPH = {"FLAGGED": "cross", "DISPUTED": "alert", "RESOLVED": "check", "CLEAN": "check"}
+BG, WHITE, MUTED, DIM = (11, 13, 19), (246, 248, 252), (150, 158, 176), (96, 104, 122)
 
 def _font(bold, size):
     for p in (os.path.join(FONT_DIR, "Montserrat-Bold.ttf" if bold else "Montserrat-Regular.ttf"),
@@ -582,65 +598,145 @@ def _fit(dr, text, font, maxw):
         text = text[:-2].rstrip() + "…"
     return text
 
+def _spaced(dr, x, y, text, font, fill, gap, anchor="l"):
+    """Letter-spaced text (small caps labels). y is the vertical middle."""
+    total = sum(dr.textlength(ch, font=font) + gap for ch in text) - gap
+    if anchor == "m": x -= total / 2
+    elif anchor == "r": x -= total
+    for ch in text:
+        dr.text((x, y), ch, font=font, fill=fill, anchor="lm")
+        x += dr.textlength(ch, font=font) + gap
+
+def _glyph(dr, kind, cx, cy, r, color):
+    w = max(3, int(r * 0.2))
+    if kind == "check":
+        dr.line([(cx - r * .42, cy + r * .02), (cx - r * .1, cy + r * .36), (cx + r * .46, cy - r * .34)],
+                fill=color, width=w, joint="curve")
+    elif kind == "cross":
+        dr.line([(cx - r * .32, cy - r * .32), (cx + r * .32, cy + r * .32)], fill=color, width=w)
+        dr.line([(cx - r * .32, cy + r * .32), (cx + r * .32, cy - r * .32)], fill=color, width=w)
+    else:                                                   # alert "!"
+        dr.line([(cx, cy - r * .45), (cx, cy + r * .12)], fill=color, width=w)
+        dr.ellipse((cx - w * .62, cy + r * .34 - w * .62, cx + w * .62, cy + r * .34 + w * .62), fill=color)
+
+def _backdrop(W, H, S, col, av):
+    """Dark background; if there is an avatar, a heavily blurred copy of it glows behind everything."""
+    base = Image.new("RGB", (W * S, H * S), BG)
+    if av is not None:
+        small = ImageOps.fit(av, (W // 5, H // 5)).filter(ImageFilter.GaussianBlur(10))
+        glow = small.resize((W * S, H * S), Image.LANCZOS)
+        base = Image.blend(base, glow, 0.42)
+    base = Image.blend(base, Image.new("RGB", base.size, col), 0.08)
+    shade = Image.linear_gradient("L").resize(base.size)                  # black->white top to bottom
+    shade = shade.point(lambda v: int(v * 0.55))                          # darken toward the bottom
+    return Image.composite(Image.new("RGB", base.size, BG), base, shade)
+
 def render_card(d, avatar=None):
-    """Clean status card. d = dict(username, name, uid, status, reports, verified, last, bot). Returns PNG bytes."""
-    W, H = 1000, 460
-    S = 2                                                     # draw at 2x, shrink for smooth edges
-    img = Image.new("RGB", (W * S, H * S), BG)
-    dr = ImageDraw.Draw(img)
+    """Status card. d = dict(username, alts, name, uid, status, reports, verified, last, bot). Returns PNG bytes."""
+    W, H, S = 1000, 600, 2                                    # drawn at 2x, shrunk at the end for smooth edges
+    px = lambda v: int(v * S)
     lab, col, note = CARD_STYLE[d["status"]]
+    kind = GLYPH[d["status"]]
     def F(bold, size): return _font(bold, size * S)
-    def R(box, r, **k): dr.rounded_rectangle([v * S for v in box], r * S, **k)
 
-    R((0, 0, W - 1, H - 1), 30, fill=PANEL)                   # card
-    dr.rectangle((0, 0, W * S, 10 * S), fill=col)             # accent bar, clipped by the corners below
-    mask = Image.new("L", img.size, 0)
-    ImageDraw.Draw(mask).rounded_rectangle((0, 0, W * S - 1, H * S - 1), 30 * S, fill=255)
-    bg = Image.new("RGB", img.size, BG); bg.paste(img, (0, 0), mask); img = bg; dr = ImageDraw.Draw(img)
-
-    # avatar
-    D, ax, ay = 190, 60, 70
-    pic = None
+    av = None
     if avatar:
-        try: pic = ImageOps.fit(Image.open(io.BytesIO(avatar)).convert("RGB"), (D * S, D * S))
-        except Exception: pic = None
-    if pic is None:
-        pic = Image.new("RGB", (D * S, D * S), _mix(col, PANEL, 0.35))
-        ImageDraw.Draw(pic).text((D * S // 2, D * S // 2), (d["name"] or d["username"] or "?")[0].upper(),
-                                 font=F(True, 90), fill=col, anchor="mm")
-    m = Image.new("L", (D * S, D * S), 0); ImageDraw.Draw(m).ellipse((0, 0, D * S - 1, D * S - 1), fill=255)
-    dr.ellipse(((ax - 7) * S, (ay - 7) * S, (ax + D + 7) * S, (ay + D + 7) * S), fill=col)
-    dr.ellipse(((ax - 3) * S, (ay - 3) * S, (ax + D + 3) * S, (ay + D + 3) * S), fill=PANEL)
-    img.paste(pic, (ax * S, ay * S), m)
+        try: av = Image.open(io.BytesIO(avatar)).convert("RGB")
+        except Exception: av = None
 
-    # name / @username / id
-    x = 300
-    dr.text((x * S, 68 * S), _fit(dr, d["name"] or "Unknown", F(True, 46), 640 * S), font=F(True, 46), fill=WHITE)
-    sub = f"@{d['username']}" if d["username"] else "no username"
-    if d.get("uid"): sub += f"   ·   ID {d['uid']}"
-    dr.text((x * S, 128 * S), _fit(dr, sub, F(False, 24), 640 * S), font=F(False, 24), fill=MUTED)
+    base = _backdrop(W, H, S, col, av).convert("RGBA")
+    meas = ImageDraw.Draw(base)
+    tw = lambda text, font: meas.textlength(text, font=font) / S          # width in card units
 
-    # status badge + note
-    bf = F(True, 22)
-    tw = dr.textlength(lab, font=bf) / S
-    R((x, 180, x + tw + 62, 222), 21, fill=_mix(col, PANEL, 0.18), outline=col, width=2 * S)
-    dr.ellipse(((x + 18) * S, 195 * S, (x + 30) * S, 207 * S), fill=col)
-    dr.text(((x + 42) * S, 201 * S), lab, font=bf, fill=col, anchor="lm")
-    dr.text((x * S, 244 * S), _fit(dr, note, F(False, 22), 640 * S), font=F(False, 22), fill=MUTED)
+    # glow behind the avatar
+    D, ax, ay = 220, 70, 110
+    glow = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    ImageDraw.Draw(glow).ellipse([px(ax - 8), px(ay - 8), px(ax + D + 8), px(ay + D + 8)], fill=col + (150,))
+    base = Image.alpha_composite(base, glow.filter(ImageFilter.GaussianBlur(px(26))))
 
-    # stats row
-    dr.line((60 * S, 320 * S, (W - 60) * S, 320 * S), fill=LINE, width=2 * S)
-    cols = [(str(d["reports"]), "REPORTS"), (str(d["verified"]), "VERIFIED"), (d.get("last") or "—", "LAST REPORT")]
-    cw = (W - 120) / 3
-    for i, (v, k) in enumerate(cols):
-        cx = int(60 + cw * i + cw / 2)
-        dr.text((cx * S, 360 * S), v, font=F(True, 44 if len(v) < 8 else 34), fill=WHITE, anchor="mm")
-        dr.text((cx * S, 398 * S), k, font=F(True, 17), fill=MUTED, anchor="mm")
-        if i: dr.line((int(60 + cw * i) * S, 338 * S, int(60 + cw * i) * S, 410 * S), fill=LINE, width=2 * S)
+    # frosted-glass layer (drawn first so the text lands on top)
+    ov = Image.new("RGBA", base.size, (0, 0, 0, 0)); od = ImageDraw.Draw(ov)
+    def glass(box, r, a=24, outline=(255, 255, 255, 48), fill=None):
+        od.rounded_rectangle([px(v) for v in box], px(r), fill=fill or (255, 255, 255, a), outline=outline, width=S)
 
-    dr.text(((W // 2) * S, 436 * S), f"Powered by @{d['bot']}", font=F(False, 16), fill=(95, 102, 118), anchor="mm")
-    img = img.resize((W, H), Image.LANCZOS)
-    out = io.BytesIO(); img.save(out, "PNG"); return out.getvalue()
+    X = 340                                                    # right column start
+    f_id = F(False, 21)
+    id_txt = f"ID  {d['uid']}" if d.get("uid") else "ID  unknown"
+    id_w = tw(id_txt, f_id) + 40
+    glass((X, 226, X + id_w, 268), 21)
+
+    f_pill = F(True, 25)
+    pill_w = 62 + tw(lab, f_pill) + 30
+    glass((X, 296, X + pill_w, 350), 27, fill=col + (46,), outline=col + (210,))
+
+    od.line([px(70), px(84), px(W - 70), px(84)], fill=(255, 255, 255, 34), width=S)   # header rule
+    pw = (W - 140 - 40) / 3
+    for i in range(3):
+        x0 = 70 + i * (pw + 20)
+        glass((x0, 420, x0 + pw, 540), 22)
+
+    img = Image.alpha_composite(base, ov)
+    dr = ImageDraw.Draw(img)
+
+    # header
+    dr.ellipse((px(70), px(42), px(82), px(54)), fill=col)
+    _spaced(dr, px(96), px(48), "ACCOUNT CHECK", F(True, 17), MUTED, px(3))
+    dr.text((px(W - 70), px(48)), f"@{d['bot']}", font=F(False, 19), fill=MUTED, anchor="rm")
+
+    # avatar with ring
+    pic = None
+    if av is not None:
+        pic = ImageOps.fit(av, (px(D), px(D)))
+    else:
+        pic = Image.new("RGB", (px(D), px(D)), _mix(col, BG, 0.4))
+        ImageDraw.Draw(pic).text((px(D) // 2, px(D) // 2), (d["name"] or d["username"] or "?")[0].upper(),
+                                 font=F(True, 100), fill=WHITE, anchor="mm")
+    m = Image.new("L", (px(D), px(D)), 0); ImageDraw.Draw(m).ellipse((0, 0, px(D) - 1, px(D) - 1), fill=255)
+    dr.ellipse((px(ax - 7), px(ay - 7), px(ax + D + 7), px(ay + D + 7)), fill=col)
+    dr.ellipse((px(ax - 3), px(ay - 3), px(ax + D + 3), px(ay + D + 3)), fill=(14, 16, 22))
+    img.paste(pic, (px(ax), px(ay)), m)
+
+    # name / @username / ID
+    f_name = F(True, 54)
+    dr.text((px(X), px(150)), _fit(dr, d["name"] or "Unknown", f_name, px(W - X - 60)), font=f_name, fill=WHITE, anchor="lm")
+    if d.get("username"):
+        f_u = F(True, 29)
+        main = f"@{d['username']}"
+        dr.text((px(X), px(204)), main, font=f_u, fill=col, anchor="lm")
+        alts = d.get("alts") or []
+        if alts:
+            x_extra = X + tw(main, f_u) + 18
+            extra = "aka " + ", ".join("@" + a for a in alts)
+            f_x = F(False, 20)
+            dr.text((px(x_extra), px(206)), _fit(dr, extra, f_x, px(W - 60 - x_extra)), font=f_x, fill=MUTED, anchor="lm")
+    else:
+        dr.text((px(X), px(204)), "no username", font=F(False, 27), fill=MUTED, anchor="lm")
+    dr.text((px(X + 20), px(247)), id_txt, font=f_id, fill=MUTED, anchor="lm")
+
+    # status pill + note
+    cx, cy, cr = X + 29, 323, 19
+    dr.ellipse((px(cx - cr), px(cy - cr), px(cx + cr), px(cy + cr)), fill=col)
+    _glyph(dr, kind, px(cx), px(cy), px(cr), (14, 16, 22))
+    dr.text((px(X + 58), px(323)), lab, font=f_pill, fill=col, anchor="lm")
+    f_n = F(False, 21)
+    dr.text((px(X), px(378)), _fit(dr, note, f_n, px(W - X - 60)), font=f_n, fill=MUTED, anchor="lm")
+
+    # stats
+    stats = [(str(d["reports"]), "REPORTS"), (str(d["verified"]), "VERIFIED"), (d.get("last") or "—", "LAST REPORT")]
+    for i, (v, k) in enumerate(stats):
+        cxm = 70 + i * (pw + 20) + pw / 2
+        hot = d["reports"] > 0 and i < 2
+        size = 54 if len(v) < 8 else 34
+        dr.text((px(cxm), px(470)), v, font=F(True, size), fill=col if hot else WHITE, anchor="mm")
+        _spaced(dr, px(cxm), px(515), k, F(True, 15), MUTED, px(3), anchor="m")
+
+    _spaced(dr, px(W / 2), px(574), f"POWERED BY @{d['bot'].upper()}", F(True, 13), DIM, px(2.5), anchor="m")
+
+    mask = Image.new("L", img.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, px(W) - 1, px(H) - 1), px(34), fill=255)
+    out = Image.new("RGB", img.size, BG); out.paste(img.convert("RGB"), (0, 0), mask)
+    out = out.resize((W, H), Image.LANCZOS)
+    buf = io.BytesIO(); out.save(buf, "PNG"); return buf.getvalue()
 
 async def avatar_bytes(uid):
     """Fallback avatar via the bot (only works for users who have talked to the bot)."""
@@ -668,26 +764,32 @@ def status_data(t):
                             reports=len(reps), verified=sum(r.status == "VERIFIED" for r in reps),
                             bot=PUB_USERNAME, rid=last.id if last else None,
                             last=f"{last.created_at:%d %b %Y}" if last else None,
-                            proof=(post_url(last) or last.proof_link) if last else None))
+                            proof=(post_url(last) or last.proof_link) if last else None,
+                            aliases=aliases_of(s, sub)))
     return out
 
 async def send_status(u, t):
     t = t.strip().lstrip("@")
-    info = await lookup_user(int(t) if t.isdigit() else t)           # live lookup: ID, name, photo
+    info = await lookup_user(int(t) if t.isdigit() else t)           # live lookup: ID, name, photo, usernames
     if info: await asyncio.to_thread(refresh_known, info)
     rows = await asyncio.to_thread(status_data, str(info["uid"]) if info else t)
     if not rows:                                                      # nobody reported -> clean card
         rows = [dict(uid=info["uid"] if info else (int(t) if t.isdigit() else None),
                      username=info["username"] if info else (None if t.isdigit() else t),
-                     name=info["name"] if info else None,
+                     name=info["name"] if info else None, aliases=[],
                      status="CLEAN", reports=0, verified=0, bot=PUB_USERNAME, rid=None, last=None, proof=None)]
     private = u.effective_chat.type == ChatType.PRIVATE               # buttons only in the bot's own chat
     for d in rows:
-        photo = None
+        photo, extra = None, []
         if info and d["uid"] == info["uid"]:                          # fill the gaps with fresh data
             d["name"] = info["name"] or d["name"]
             d["username"] = info["username"] or d["username"]
-            photo = info["photo"]
+            photo, extra = info["photo"], list(info.get("names") or [])
+        alts = []                                                     # other usernames ("aka")
+        for n in extra + list(d.get("aliases") or []):
+            if n and n.lower() != (d["username"] or "").lower() and n.lower() not in [a.lower() for a in alts]:
+                alts.append(n)
+        d["alts"] = alts[:3]
         photo = photo or await avatar_bytes(d["uid"])
         png = await asyncio.to_thread(render_card, d, photo)
         if not private:                                               # groups / supergroups: image only, no buttons
@@ -1471,7 +1573,9 @@ async def a_text(u, c):
         c.user_data.pop("await")
         if uname and not uid:                                    # let the lookup account fill in ID + name
             info = await lookup_user(uname)
-            if info: uid, name = info["uid"], info["name"]; uname = info["username"] or uname
+            if info:
+                uid, name = info["uid"], info["name"]
+                uname = info["username"] or uname
         with Session() as s:
             r = s.get(Report, rid); sub = s.get(Subject, r.subject_id); old = None
             if uid and sub.user_id != uid:
