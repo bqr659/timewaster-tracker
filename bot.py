@@ -56,6 +56,7 @@ def Btn(text, data):
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("tw")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ───────────────────────── config ─────────────────────────
 def need(name):
