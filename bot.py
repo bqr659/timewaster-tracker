@@ -1,5 +1,5 @@
 """
-Timewaster Tracker v3.2  -  two Telegram bots in one process.
+Timewaster Tracker v3.3  -  two Telegram bots in one process.
 
 PUBLIC BOT  (BOT_TOKEN)        : file reports, /status users (image card), track / withdraw your reports,
                                  answer admin questions, appeal a report against you.
@@ -8,19 +8,21 @@ ADMIN BOT   (ADMIN_BOT_TOKEN)  : button panel -> approve / reject / ask reporter
 CHANNEL     (CHANNEL_ID)       : approved reports are auto-posted (photos + details) and edited
                                  automatically when the status or the @ changes.
 TRACKER                        : follows users by numeric ID, detects @ swaps, updates posts.
+LOOKUP ACCOUNT (Telethon)      : a spare normal Telegram account that can resolve ANY public @username
+                                 into numeric ID + name + profile picture (bots cannot do this).
 
 Required env : BOT_TOKEN, ADMIN_BOT_TOKEN, CHANNEL_ID, DATABASE_URL, ADMIN_IDS
+Lookup env   : TG_API_ID, TG_API_HASH, TG_SESSION   (from my.telegram.org + a StringSession; see notes)
 Optional env : CHANNEL_USERNAME, TRACK_INTERVAL_MIN (30), MAX_PENDING_PER_USER (3),
                REPORT_COOLDOWN_MIN (10), MAX_REPORTS_PER_DAY (5), REMIND_AFTER_HOURS (24), PORT
-Requires     : Pillow  (add "Pillow" to requirements.txt)
+Requires     : Pillow, telethon  (add both to requirements.txt)
 Optional     : fonts/Montserrat-Bold.ttf + fonts/Montserrat-Regular.ttf next to this file (nicer card text)
 
-v3.2 changes: /check is now /status and answers with a generated profile card image
-(avatar, @username, display name, status pill, Reports / Verified / Status boxes, buttons).
-/check still works as an alias.
-v3.1 changes: automatic column migration for old databases, DB self-check at startup (admins get
-a DM if a table is broken), /dbtest admin command, passive_track can no longer crash a handler,
-version-independent "forwarded message" filter.
+v3.3 changes: /status now uses a Telethon lookup account, so ANY public @username (or an ID the lookup
+account has seen) shows its real name, numeric ID and profile picture on the card. Reports also capture the
+numeric ID automatically when the reporter types only an @username.
+v3.2 changes: /check is now /status and answers with a generated profile card image.
+v3.1 changes: automatic column migration, DB self-check at startup, /dbtest, safer passive_track.
 Proof is a Telegram channel link only (no screenshots in the report wizard).
 """
 import os, re, io, csv, sys, html, time, asyncio, logging, threading, traceback, textwrap
@@ -39,6 +41,14 @@ from telegram.constants import ParseMode, ChatType
 from telegram.error import TelegramError, BadRequest, RetryAfter, NetworkError
 from telegram.ext import (Application, CommandHandler, MessageHandler, CallbackQueryHandler,
                           ConversationHandler, TypeHandler, filters)
+
+try:                                                    # lookup account is optional: bot still runs without it
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    from telethon.tl.types import User as TLUser
+    HAVE_TELETHON = True
+except ImportError:
+    HAVE_TELETHON = False
 
 def Btn(text, data):
     """Callback button. (InlineKeyboardButton's 2nd positional arg is `url`, so callback_data must be named.)"""
@@ -330,6 +340,47 @@ async def channel_check():
     if miss: return False, "The public bot lacks channel permission(s): " + ", ".join(miss)
     return True, "Channel OK (public bot can post, edit and delete)."
 
+# ───────────────────────── lookup account (Telethon) ─────────────────────────
+# A normal Telegram account (use a SPARE one) that can resolve any public @username to ID + name + photo.
+LOOKUP = {"client": None}
+
+async def start_lookup():
+    aid, ah, ss = os.getenv("TG_API_ID", "").strip(), os.getenv("TG_API_HASH", "").strip(), os.getenv("TG_SESSION", "").strip()
+    if not HAVE_TELETHON:
+        log.warning("telethon is not installed - add 'telethon' to requirements.txt. /status will show limited info."); return
+    if not (aid and ah and ss):
+        log.warning("Lookup account not configured (TG_API_ID / TG_API_HASH / TG_SESSION) - /status will show limited info."); return
+    try:
+        cl = TelegramClient(StringSession(ss), int(aid), ah)
+        await cl.connect()
+        if not await cl.is_user_authorized():
+            log.error("Lookup session is not logged in - generate a new TG_SESSION."); return
+        LOOKUP["client"] = cl
+        log.info("Lookup account ready.")
+    except Exception:
+        log.exception("lookup start")
+
+async def lookup_user(target):
+    """@username (str) or numeric ID (int) -> dict(uid, username, name, photo) or None."""
+    cl = LOOKUP["client"]
+    if not cl: return None
+    try:
+        ent = await cl.get_entity(target)
+        if not isinstance(ent, TLUser): return None
+        name = " ".join(x for x in (ent.first_name, ent.last_name) if x) or None
+        try: photo = await cl.download_profile_photo(ent, file=bytes)
+        except Exception: photo = None
+        return dict(uid=ent.id, username=ent.username, name=name, photo=photo or None)
+    except Exception as e:
+        log.info("lookup %s failed: %s", target, e)
+        return None
+
+def refresh_known(info):
+    """If this person is already in our database, update their name / @ / ID."""
+    with Session() as s:
+        if find_subjects(s, str(info["uid"])) or (info["username"] and find_subjects(s, info["username"])):
+            upsert_subject(s, info["username"], info["uid"], info["name"]); s.commit()
+
 # ───────────────────────── channel posting ─────────────────────────
 def render_post(s, r):
     """Compact channel caption:  ❌ User @name (123456) has been marked as a timewaster."""
@@ -591,6 +642,7 @@ def render_card(d, avatar=None):
     out = io.BytesIO(); img.save(out, "PNG"); return out.getvalue()
 
 async def avatar_bytes(uid):
+    """Fallback avatar via the bot (only works for users who have talked to the bot)."""
     if not uid: return None
     try:
         ph = await pub.bot.get_user_profile_photos(uid, limit=1)
@@ -619,15 +671,25 @@ def status_data(t):
     return out
 
 async def send_status(u, t):
-    rows = await asyncio.to_thread(status_data, t)
-    if not rows:                                     # unknown account -> clean card
-        t = t.strip().lstrip("@")
-        rows = [dict(uid=int(t) if t.isdigit() else None, username=None if t.isdigit() else t, name=None,
+    t = t.strip().lstrip("@")
+    info = await lookup_user(int(t) if t.isdigit() else t)           # live lookup: ID, name, photo
+    if info: await asyncio.to_thread(refresh_known, info)
+    rows = await asyncio.to_thread(status_data, str(info["uid"]) if info else t)
+    if not rows:                                                      # nobody reported -> clean card
+        rows = [dict(uid=info["uid"] if info else (int(t) if t.isdigit() else None),
+                     username=info["username"] if info else (None if t.isdigit() else t),
+                     name=info["name"] if info else None,
                      status="CLEAN", reports=0, verified=0, bot=PUB_USERNAME, rid=None, last=None, proof=None)]
-    private = u.effective_chat.type == ChatType.PRIVATE      # buttons only in the bot's own chat
+    private = u.effective_chat.type == ChatType.PRIVATE               # buttons only in the bot's own chat
     for d in rows:
-        png = await asyncio.to_thread(render_card, d, await avatar_bytes(d["uid"]))
-        if not private:                                       # groups / supergroups: image only, no buttons
+        photo = None
+        if info and d["uid"] == info["uid"]:                          # fill the gaps with fresh data
+            d["name"] = info["name"] or d["name"]
+            d["username"] = info["username"] or d["username"]
+            photo = info["photo"]
+        photo = photo or await avatar_bytes(d["uid"])
+        png = await asyncio.to_thread(render_card, d, photo)
+        if not private:                                               # groups / supergroups: image only, no buttons
             await u.effective_message.reply_photo(io.BytesIO(png)); continue
         prof = (f"https://t.me/{d['username']}" if d["username"]
                 else f"tg://user?id={d['uid']}" if d["uid"] else None)
@@ -720,14 +782,21 @@ async def got_target(u, c):
         await say(u, "You can't report yourself 🙂"); return TARGET
     if uid in ADMIN_IDS:
         await say(u, "That account is protected and can't be reported."); return TARGET
-    if uname and not uid:               # best-effort: resolve @ -> ID
-        try:
-            ch = await c.bot.get_chat("@" + uname)
-            if ch.type == ChatType.PRIVATE:
-                uid, name = ch.id, ch.full_name
-                if uid in ADMIN_IDS:
-                    await say(u, "That account is protected and can't be reported."); return TARGET
-        except TelegramError: pass
+    if uname and not uid:               # resolve @ -> numeric ID (lookup account first, then the bot itself)
+        info = await lookup_user(uname)
+        if info:
+            uid, name = info["uid"], info["name"]
+            if info["username"]: uname = info["username"]
+        else:
+            try:
+                ch = await c.bot.get_chat("@" + uname)
+                if ch.type == ChatType.PRIVATE:
+                    uid, name = ch.id, ch.full_name
+            except TelegramError: pass
+        if uid in ADMIN_IDS:
+            await say(u, "That account is protected and can't be reported."); return TARGET
+        if uid == u.effective_user.id:
+            await say(u, "You can't report yourself 🙂"); return TARGET
     c.user_data["rep"].update(uid=uid, uname=uname, name=name)
     kb = Kb([[Btn(d, f"d:{i}")] for i, d in enumerate(DEALS)])
     await say(u, "<b>Step 2/4 · What type of deal was it?</b>", kb)
@@ -1177,7 +1246,8 @@ async def diagnostics():
         pend = s.query(Report).filter_by(status="PENDING").count()
     tr = STATE["track_res"]
     up = int(time.time() - STARTED)
-    return ("🩺 <b>Diagnostics</b>\n\n" + ("🟢 " if ok else "🔴 ") + esc(msg) +
+    lk = "🟢 Lookup account: ready" if LOOKUP["client"] else "🔴 Lookup account: NOT connected (set TG_API_ID / TG_API_HASH / TG_SESSION)"
+    return ("🩺 <b>Diagnostics</b>\n\n" + ("🟢 " if ok else "🔴 ") + esc(msg) + "\n" + lk +
             f"\n🤖 Public bot: @{esc(PUB_USERNAME)}\n👮 Admins: {len(ADMIN_IDS)}\n📥 Pending: {pend}\n"
             f"📡 Tracker: " + (f"last run {STATE['track_at']:%H:%M} UTC - {tr[0]}/{tr[2]} reachable"
                                if tr else "hasn't run yet") +
@@ -1398,6 +1468,9 @@ async def a_text(u, c):
         uid, uname, name, err = parse_identity(m)
         if err: await show(u, "⚠️ " + esc(err)); return
         c.user_data.pop("await")
+        if uname and not uid:                                    # let the lookup account fill in ID + name
+            info = await lookup_user(uname)
+            if info: uid, name = info["uid"], info["name"]; uname = info["username"] or uname
         with Session() as s:
             r = s.get(Report, rid); sub = s.get(Subject, r.subject_id); old = None
             if uid and sub.user_id != uid:
@@ -1480,6 +1553,7 @@ async def main():
     for a in (pub, adm):
         await a.initialize(); await a.start()
     PUB_USERNAME = pub.bot.username
+    await start_lookup()                                         # Telethon lookup account (ID / name / photo)
     await pub.bot.set_my_commands([BotCommand("start", "Menu"), BotCommand("report", "File a report"),
                                    BotCommand("status", "Look up a user"), BotCommand("my", "My reports"),
                                    BotCommand("track", "Track a report by ID"),
@@ -1505,6 +1579,9 @@ async def main():
         for t in tasks: t.cancel()
         for a in (pub, adm):
             await a.updater.stop(); await a.stop(); await a.shutdown()
+        if LOOKUP["client"]:
+            try: await LOOKUP["client"].disconnect()
+            except Exception: pass
         if lock is not None: lock.close()
 
 if __name__ == "__main__":
