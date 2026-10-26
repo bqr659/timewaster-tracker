@@ -1,5 +1,5 @@
 """
-Timewaster Tracker v3.5  -  two Telegram bots in one process.
+Timewaster Tracker v3.6  -  two Telegram bots in one process.
 
 PUBLIC BOT  (BOT_TOKEN)        : file reports, /status users (image card), track / withdraw your reports,
                                  answer admin questions, appeal a report against you.
@@ -14,10 +14,15 @@ LOOKUP ACCOUNT (Telethon)      : a spare normal Telegram account that can resolv
 Required env : BOT_TOKEN, ADMIN_BOT_TOKEN, CHANNEL_ID, DATABASE_URL, ADMIN_IDS
 Lookup env   : TG_API_ID, TG_API_HASH, TG_SESSION   (from my.telegram.org + a StringSession)
 Optional env : CHANNEL_USERNAME, TRACK_INTERVAL_MIN (30), MAX_PENDING_PER_USER (3),
-               REPORT_COOLDOWN_MIN (10), MAX_REPORTS_PER_DAY (5), REMIND_AFTER_HOURS (24), PORT
+               REPORT_COOLDOWN_MIN (10), MAX_REPORTS_PER_DAY (5), REMIND_AFTER_HOURS (24), PORT,
+               OWNER_ID (6781734506), FLOOD_MSGS (5), FLOOD_SECS (8), FLOOD_MUTE (30)
 Requires     : Pillow, telethon  (add both to requirements.txt)
 Optional     : fonts/Montserrat-Bold.ttf + fonts/Montserrat-Regular.ttf next to this file (nicer card text)
 
+v3.6 changes:
+  1. Anti-flood for GROUPS ONLY: bursts of messages are deleted, flooders are put on a short cooldown.
+     (Make the public bot a group admin with "Delete messages".)
+  2. Owner-only gold "FOUNDER PROFILE" card (crown badge, sparkles, gold border).
 v3.5.1: glass card rebuilt (vivid backdrop, real frosted panels) and ~10x faster (cached lookups + cards).
 v3.5 changes:
   1. "View Full Report" (channel post + /status card) now opens the PROOF CHANNEL link directly, not the bot.
@@ -45,7 +50,7 @@ from telegram import (Update, InlineKeyboardButton as _IKB, InlineKeyboardMarkup
 from telegram.constants import ParseMode, ChatType
 from telegram.error import TelegramError, BadRequest, RetryAfter, NetworkError
 from telegram.ext import (Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-                          ConversationHandler, TypeHandler, filters)
+                          ConversationHandler, TypeHandler, ApplicationHandlerStop, filters)
 
 try:                                                    # lookup account is optional: bot still runs without it
     from telethon import TelegramClient
@@ -619,9 +624,15 @@ CARD_STYLE = {   # status -> (badge text, accent colour, one-line note)
     "DISPUTED": ("DISPUTED",   (255, 176, 46),  "Reports exist, but the case is currently disputed."),
     "RESOLVED": ("RESOLVED",   (56, 208, 148),  "Previously reported, but the case has been resolved."),
     "CLEAN":    ("NO REPORTS", (92, 168, 255),  "No public reports were found for this account."),
+    "OWNER":    ("OWNER",      (255, 196, 54),  "Founder & owner of this bot. Fully trusted."),
 }
-GLYPH = {"FLAGGED": "cross", "DISPUTED": "alert", "RESOLVED": "check", "CLEAN": "check"}
+GLYPH = {"FLAGGED": "cross", "DISPUTED": "alert", "RESOLVED": "check", "CLEAN": "check", "OWNER": "crown"}
 BG, WHITE, MUTED, DIM = (11, 13, 19), (246, 248, 252), (176, 184, 204), (130, 138, 158)
+
+# Owner-only gold card
+OWNER_ID = int(os.getenv("OWNER_ID", "6781734506"))              # your ID from the card; override with env OWNER_ID
+OWNER_PAL = ((255, 140, 40), (255, 214, 90), (255, 96, 120))     # orange, yellow, rose
+def is_owner(d): return bool(d.get("uid")) and d["uid"] == OWNER_ID
 
 def _font(bold, size):
     for p in (os.path.join(FONT_DIR, "Montserrat-Bold.ttf" if bold else "Montserrat-Regular.ttf"),
@@ -655,9 +666,17 @@ def _glyph(dr, kind, cx, cy, r, color):
     elif kind == "cross":
         dr.line([(cx - r * .32, cy - r * .32), (cx + r * .32, cy + r * .32)], fill=color, width=w)
         dr.line([(cx - r * .32, cy + r * .32), (cx + r * .32, cy - r * .32)], fill=color, width=w)
+    elif kind == "crown":
+        pts = [(-.55, .36), (-.55, -.3), (-.26, 0), (0, -.46), (.26, 0), (.55, -.3), (.55, .36)]
+        dr.polygon([(cx + x * r, cy + y * r) for x, y in pts], fill=color)
     else:                                                   # alert "!"
         dr.line([(cx, cy - r * .45), (cx, cy + r * .12)], fill=color, width=w)
         dr.ellipse((cx - w * .62, cy + r * .34 - w * .62, cx + w * .62, cy + r * .34 + w * .62), fill=color)
+
+def _sparkle(dr, cx, cy, r, color):
+    k = r * .28
+    dr.polygon([(cx, cy - r), (cx + k, cy - k), (cx + r, cy), (cx + k, cy + k),
+                (cx, cy + r), (cx - k, cy + k), (cx - r, cy), (cx - k, cy - k)], fill=color)
 
 def _fast_blur(im, radius, f=4):
     """Gaussian blur done at 1/f size then scaled back up: looks the same, many times faster."""
@@ -666,10 +685,10 @@ def _fast_blur(im, radius, f=4):
     small = small.filter(ImageFilter.GaussianBlur(max(0.6, radius / f)))
     return small.resize((w, h), Image.BILINEAR)
 
-def _backdrop(W, H, S, col, av):
+def _backdrop(W, H, S, col, av, pal=None):
     """Vivid background for the glass to blur: soft colour wash + crisp glossy orbs peeking around the card."""
     sw, sh = W // 4, H // 4
-    violet, cyan, pink = (150, 110, 255), (60, 205, 255), (255, 105, 190)
+    violet, cyan, pink = pal or ((150, 110, 255), (60, 205, 255), (255, 105, 190))
     soft = Image.new("RGB", (sw, sh), BG)
     sd = ImageDraw.Draw(soft)
     for cx, cy, r, c in ((170, 130, 260, col), (880, 520, 300, violet), (840, 60, 200, cyan), (120, 570, 190, pink)):
@@ -728,6 +747,7 @@ def render_card(d, avatar=None):
     px = lambda v: int(v * S)
     lab, col, note = CARD_STYLE[d["status"]]
     kind = GLYPH[d["status"]]
+    owner = d["status"] == "OWNER"
     def F(bold, size): return _font(bold, size * S)
 
     av = None
@@ -735,7 +755,7 @@ def render_card(d, avatar=None):
         try: av = Image.open(io.BytesIO(avatar)).convert("RGB")
         except Exception: av = None
 
-    img = _backdrop(W, H, S, col, av)
+    img = _backdrop(W, H, S, col, av, OWNER_PAL if owner else None)
     meas = ImageDraw.Draw(img)
     tw = lambda text, font: meas.textlength(text, font=font) / S          # width in card units
 
@@ -753,7 +773,8 @@ def render_card(d, avatar=None):
     f_pill = F(True, 25)
     pill_w = 62 + tw(lab, f_pill) + 30
     f_h, f_b = F(True, 17), F(False, 19)
-    head_txt, bot_txt = "ACCOUNT CHECK", f"@{d['bot']}"
+    head_txt = "FOUNDER PROFILE" if owner else "ACCOUNT CHECK"
+    bot_txt = f"@{d['bot']}"
     head_w = sum(tw(ch, f_h) + 3 for ch in head_txt) - 3
     bot_w = tw(bot_txt, f_b)
     pw = (W - 140 - 40) / 3
@@ -788,6 +809,11 @@ def render_card(d, avatar=None):
     m = Image.new("L", (px(D), px(D)), 0); ImageDraw.Draw(m).ellipse((0, 0, px(D) - 1, px(D) - 1), fill=255)
     img.paste(pic, (px(ax), px(ay)), m)
     dr.ellipse((px(ax - 3), px(ay - 3), px(ax + D + 3), px(ay + D + 3)), outline=col, width=px(3))
+    if owner:                                                    # crown badge on the avatar
+        bx, by, br = ax + D - 18, ay + D - 18, 36
+        dr.ellipse((px(bx - br - 4), px(by - br - 4), px(bx + br + 4), px(by + br + 4)), fill=(14, 16, 22, 255))
+        dr.ellipse((px(bx - br), px(by - br), px(bx + br), px(by + br)), fill=col)
+        _glyph(dr, "crown", px(bx), px(by), px(br), (14, 16, 22))
 
     # name / @username / ID
     f_name = F(True, 54)
@@ -815,15 +841,21 @@ def render_card(d, avatar=None):
     dr.text((px(X), px(378)), _fit(dr, note, f_n, px(W - X - 60)), font=f_n, fill=WHITE, anchor="lm")
 
     # stats
-    stats = [(str(d["reports"]), "REPORTS"), (str(d["verified"]), "VERIFIED"), (d.get("last") or "—", "LAST REPORT")]
+    stats = ([("OWNER", "ROLE"), ("100%", "TRUST"), ("FULL", "ACCESS")] if owner else
+             [(str(d["reports"]), "REPORTS"), (str(d["verified"]), "VERIFIED"), (d.get("last") or "—", "LAST REPORT")])
     for i, (v, k) in enumerate(stats):
         cxm = 70 + i * (pw + 20) + pw / 2
-        hot = d["reports"] > 0 and i < 2
+        hot = owner or (d["reports"] > 0 and i < 2)
         size = 54 if len(v) < 8 else 34
         dr.text((px(cxm), px(470)), v, font=F(True, size), fill=_mix(col, (255, 255, 255), 0.7) if hot else WHITE, anchor="mm")
         _spaced(dr, px(cxm), px(515), k, F(True, 15), (236, 241, 252), px(3), anchor="m")
 
     _spaced(dr, px(W / 2), px(562), "POWERED BY @SOWCO", F(True, 13), (200, 208, 226), px(2.5), anchor="m")
+
+    if owner:                                                    # gold border + sparkles
+        dr.rounded_rectangle((px(24), px(20), px(W - 24), px(H - 20)), px(40), outline=col + (210,), width=px(2))
+        for sx, sy, sr in ((310, 98, 12), (935, 150, 18), (968, 214, 10), (905, 252, 12), (952, 392, 14)):
+            _sparkle(dr, px(sx), px(sy), px(sr), (255, 244, 205, 235))
 
     mask = Image.new("L", img.size, 0)
     ImageDraw.Draw(mask).rounded_rectangle((0, 0, px(W) - 1, px(H) - 1), px(34), fill=255)
@@ -897,6 +929,7 @@ async def send_status(u, t):
             if n and n.lower() != (d["username"] or "").lower() and n.lower() not in [a.lower() for a in alts]:
                 alts.append(n)
         d["alts"] = alts[:3]
+        if is_owner(d): d["status"] = "OWNER"                         # gold founder card
         photo = photo or await avatar_bytes(d["uid"])
         png = await card_png(d, photo)
         if not private:                                               # groups / supergroups: image only, no buttons
@@ -914,6 +947,50 @@ async def send_status(u, t):
             await u.effective_message.reply_photo(io.BytesIO(png), reply_markup=Kb(kb))
         except BadRequest:                           # e.g. tg://user link refused by privacy settings
             await u.effective_message.reply_photo(io.BytesIO(png), reply_markup=Kb(kb[1:]))
+
+# ───────────────────────── anti-flood (groups only) ─────────────────────────
+FLOOD_MSGS = int(os.getenv("FLOOD_MSGS", "5"))      # more than this many messages...
+FLOOD_SECS = int(os.getenv("FLOOD_SECS", "8"))      # ...inside this many seconds = flood
+FLOOD_MUTE = int(os.getenv("FLOOD_MUTE", "30"))     # seconds the flooder keeps getting deleted
+_flood, _gadmins = {}, {}
+
+async def _is_group_admin(chat, uid):
+    hit = _gadmins.get(chat.id)
+    if not hit or time.time() - hit[0] > 300:
+        try: ids = {a.user.id for a in await chat.get_administrators()}
+        except TelegramError: ids = set()
+        hit = _gadmins[chat.id] = (time.time(), ids)
+    return uid in hit[1]
+
+async def _del(bot, chat_id, mid):
+    try: await bot.delete_message(chat_id, mid)
+    except TelegramError: pass          # no "delete messages" right, or already gone
+
+async def _notice(bot, chat_id, text):
+    try:
+        m = await bot.send_message(chat_id, text, parse_mode=HTML)
+        await asyncio.sleep(8); await _del(bot, chat_id, m.message_id)
+    except TelegramError: pass
+
+async def anti_flood(u: Update, c):
+    m, usr, chat = u.effective_message, u.effective_user, u.effective_chat
+    if not m or not usr or usr.is_bot or not chat: return
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP): return    # groups ONLY
+    if usr.id in ADMIN_IDS: return
+    key, t = (chat.id, usr.id), time.monotonic()
+    st = _flood.setdefault(key, {"q": [], "until": 0.0})
+    if t < st["until"]:                                    # already flagged: delete + block commands
+        await _del(c.bot, chat.id, m.message_id); raise ApplicationHandlerStop
+    st["q"] = [x for x in st["q"] if t - x[0] < FLOOD_SECS] + [(t, m.message_id)]
+    if len(st["q"]) <= FLOOD_MSGS: return
+    if await _is_group_admin(chat, usr.id):                # group admins are exempt
+        st["q"] = []; return
+    ids, st["q"], st["until"] = [i for _, i in st["q"]], [], t + FLOOD_MUTE
+    for i in ids: await _del(c.bot, chat.id, i)
+    if len(_flood) > 3000: _flood.clear()
+    asyncio.create_task(_notice(c.bot, chat.id,
+        f"🛑 {usr.mention_html()} slow down - flooding is not allowed ({FLOOD_MUTE}s cooldown)."))
+    raise ApplicationHandlerStop
 
 # ═════════════════════════ PUBLIC BOT ═════════════════════════
 TARGET, DEAL, REASON, PROOF, CONFIRM = range(5)
@@ -1270,6 +1347,7 @@ async def p_incoming(u, c):
         await say(u, "✅ Sent.", Kb([[Btn("✅ Done", "ad:done")]]))
 
 def register_public(app):
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS, anti_flood), group=-2)   # anti-flood, groups only
     app.add_handler(TypeHandler(Update, passive_track), group=-1)
     conv = ConversationHandler(
         entry_points=[CommandHandler("report", rep_start),
