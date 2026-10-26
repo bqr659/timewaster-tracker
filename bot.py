@@ -624,7 +624,7 @@ CARD_STYLE = {   # status -> (badge text, accent colour, one-line note)
     "DISPUTED": ("DISPUTED",   (255, 176, 46),  "Reports exist, but the case is currently disputed."),
     "RESOLVED": ("RESOLVED",   (56, 208, 148),  "Previously reported, but the case has been resolved."),
     "CLEAN":    ("NO REPORTS", (92, 168, 255),  "No public reports were found for this account."),
-    "OWNER":    ("OWNER",      (255, 196, 54),  "Founder & owner of this bot. Fully trusted."),
+    "OWNER":    ("OWNER",      (255, 196, 54),  "Founder & owner of this bot."),
 }
 GLYPH = {"FLAGGED": "cross", "DISPUTED": "alert", "RESOLVED": "check", "CLEAN": "check", "OWNER": "crown"}
 BG, WHITE, MUTED, DIM = (11, 13, 19), (246, 248, 252), (176, 184, 204), (130, 138, 158)
@@ -841,7 +841,7 @@ def render_card(d, avatar=None):
     dr.text((px(X), px(378)), _fit(dr, note, f_n, px(W - X - 60)), font=f_n, fill=WHITE, anchor="lm")
 
     # stats
-    stats = ([("OWNER", "ROLE"), ("100%", "TRUST"), ("FULL", "ACCESS")] if owner else
+    stats = ([("OWNER", "ROLE"), ("LIVE", "STATUS"), ("FULL", "ACCESS")] if owner else
              [(str(d["reports"]), "REPORTS"), (str(d["verified"]), "VERIFIED"), (d.get("last") or "—", "LAST REPORT")])
     for i, (v, k) in enumerate(stats):
         cxm = 70 + i * (pw + 20) + pw / 2
