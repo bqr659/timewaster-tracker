@@ -787,9 +787,12 @@ def render_card(d, avatar=None):
     _glass(img, (X, 226, X + id_w, 268), 21, S, a=28, blur=5, shadow=False)                     # ID chip
     _glass(img, (X, 296, X + pill_w, 350), 27, S, a=100, tint=col, bcol=_mix(col, (255, 255, 255), 0.5),
            blur=5, shadow=False)                                                                # status pill
-    for i in range(3):                                                                          # stat panels
-        x0 = 70 + i * (pw + 20)
-        _glass(img, (x0, 420, x0 + pw, 540), 24, S, a=20, blur=7)
+    if owner:                                                                                   # one wide panel
+        _glass(img, (70, 420, W - 70, 540), 24, S, a=24, blur=7)
+    else:
+        for i in range(3):                                                                      # stat panels
+            x0 = 70 + i * (pw + 20)
+            _glass(img, (x0, 420, x0 + pw, 540), 24, S, a=20, blur=7)
 
     dr = ImageDraw.Draw(img, "RGBA")
     dr.line([px(70), px(88), px(W - 70), px(88)], fill=(255, 255, 255, 40), width=S)            # header rule
@@ -841,8 +844,10 @@ def render_card(d, avatar=None):
     dr.text((px(X), px(378)), _fit(dr, note, f_n, px(W - X - 60)), font=f_n, fill=WHITE, anchor="lm")
 
     # stats
-    stats = ([("OWNER", "ROLE"), ("LIVE", "STATUS"), ("FULL", "ACCESS")] if owner else
+    stats = ([] if owner else
              [(str(d["reports"]), "REPORTS"), (str(d["verified"]), "VERIFIED"), (d.get("last") or "—", "LAST REPORT")])
+    if owner:                                                    # just the word OWNER
+        _spaced(dr, px(W / 2), px(480), "OWNER", F(True, 64), _mix(col, (255, 255, 255), 0.7), px(10), anchor="m")
     for i, (v, k) in enumerate(stats):
         cxm = 70 + i * (pw + 20) + pw / 2
         hot = owner or (d["reports"] > 0 and i < 2)
